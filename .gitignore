@@ -41,6 +41,7 @@ test_*.py
 !test_market_whitelist.py
 !tests/test_leverage_updates.py
 !tests/test_slippage_pricing.py
+!tests/test_trade_metrics.py
 
 # Personal notes
 notes.txt

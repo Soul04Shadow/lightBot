@@ -47,9 +47,20 @@ class DeltaNeutralOrchestrator:
         self.max_close_retries = 3
         self.close_failure_alert_active = False
         self.market_stats = {
-            market_id: {'trades': 0, 'successful': 0}
+            market_id: {
+                'trades': 0,
+                'successful': 0,
+                'notional': 0.0,
+                'volume_long': 0.0,
+                'volume_short': 0.0,
+                'bleed': 0.0,
+            }
             for market_id in config.market_whitelist
         }
+        self.total_notional = 0.0
+        self.total_volume_long = 0.0
+        self.total_volume_short = 0.0
+        self.realized_bleed = 0.0
     
     def select_random_market(self) -> int:
         """Randomly select a market from the whitelist"""
@@ -80,7 +91,104 @@ class DeltaNeutralOrchestrator:
 
         if errors:
             raise RuntimeError(f"Failed to {context}: {'; '.join(errors)}")
-    
+
+    async def _fetch_account_balances(self) -> Tuple[Optional[float], Optional[float]]:
+        """Fetch available balances for both accounts using the Lighter API."""
+        try:
+            async with self.config.api_client() as api_client:
+                account_api = lighter.AccountApi(api_client)
+
+                account1 = await account_api.account(
+                    by="index",
+                    value=str(self.config.account1_index),
+                )
+                account2 = await account_api.account(
+                    by="index",
+                    value=str(self.config.account2_index),
+                )
+
+                balance1 = None
+                balance2 = None
+
+                if account1.accounts:
+                    balance1 = float(account1.accounts[0].available_balance)
+                if account2.accounts:
+                    balance2 = float(account2.accounts[0].available_balance)
+
+                return balance1, balance2
+        except Exception as exc:
+            logger.warning("Failed to fetch account balances: %s", exc)
+
+        return None, None
+
+    def _record_trade_execution(
+        self,
+        market_index: int,
+        base_amount_decimal: float,
+        notional_usd: float,
+    ) -> None:
+        """Update aggregate trade metrics after a successful open."""
+        self.total_volume_long += base_amount_decimal
+        self.total_volume_short += base_amount_decimal
+        self.total_notional += notional_usd
+
+        market_stat = self.market_stats[market_index]
+        market_stat['notional'] += notional_usd
+        market_stat['volume_long'] += base_amount_decimal
+        market_stat['volume_short'] += base_amount_decimal
+
+    def _log_session_summary(self, prefix: str = "Session stats") -> None:
+        """Emit a summary log line with cumulative session metrics."""
+        logger.info(
+            "%s -> total_notional=$%.2f | long_volume=%.6f | short_volume=%.6f | net_bleed=$%.2f",
+            prefix,
+            self.total_notional,
+            self.total_volume_long,
+            self.total_volume_short,
+            self.realized_bleed,
+        )
+
+    async def _finalize_trade(self, position_info: dict) -> None:
+        """Compute realized bleed for a trade once both legs are closed."""
+        if position_info.get('finalized'):
+            return
+
+        pre_balances = position_info.get('pre_trade_balances')
+        if not pre_balances or pre_balances[0] is None or pre_balances[1] is None:
+            position_info['finalized'] = True
+            return
+
+        post_balances = await self._fetch_account_balances()
+        if post_balances[0] is None or post_balances[1] is None:
+            logger.warning(
+                "Skipping bleed calculation for Trade #%s due to missing post-trade balances",
+                position_info.get('trade_number', '?'),
+            )
+            position_info['finalized'] = True
+            return
+
+        delta_long = post_balances[0] - pre_balances[0]
+        delta_short = post_balances[1] - pre_balances[1]
+        trade_bleed = delta_long + delta_short
+
+        self.realized_bleed += trade_bleed
+
+        market_index = position_info.get('market_index')
+        if market_index in self.market_stats:
+            self.market_stats[market_index]['bleed'] += trade_bleed
+
+        position_info['post_trade_balances'] = post_balances
+        position_info['finalized'] = True
+
+        logger.info(
+            "Trade #%s realized PnL (bleed): $%.2f (long Δ=$%.2f, short Δ=$%.2f)",
+            position_info.get('trade_number', '?'),
+            trade_bleed,
+            delta_long,
+            delta_short,
+        )
+        self._log_session_summary("Session stats after close")
+
     async def _get_market_precision(self, market_id: int, fallback_price: float) -> int:
         """
         Get the official size_decimals precision for a market from Lighter API.
@@ -388,6 +496,7 @@ class DeltaNeutralOrchestrator:
             max_slippage = self.config.max_slippage
             long_execution_price = best_ask * (1 + max_slippage)
             short_execution_price = best_bid * (1 - max_slippage)
+            mid_price = (best_bid + best_ask) / 2
 
             if long_execution_price <= 0 or short_execution_price <= 0:
                 logger.warning(
@@ -409,11 +518,9 @@ class DeltaNeutralOrchestrator:
             
             # Calculate base_amount from USDT margin target
             if self.config.base_amount_in_usdt:
-                mid_price = (best_bid + best_ask) / 2
-                
                 # Calculate effective leverage for this trade
                 effective_leverage_long = (
-                    leverage_long if self.config.use_dynamic_leverage 
+                    leverage_long if self.config.use_dynamic_leverage
                     else self.config.leverage
                 )
                 effective_leverage_short = (
@@ -431,7 +538,7 @@ class DeltaNeutralOrchestrator:
                 target_notional = self.config.base_amount_in_usdt * avg_leverage
                 asset_amount = target_notional / mid_price
                 base_amount = max(1, round(asset_amount * precision_multiplier))
-                
+
                 # Calculate actual values for logging
                 base_amount_decimal = base_amount / precision_multiplier
                 actual_notional_usd = base_amount_decimal * mid_price
@@ -455,6 +562,8 @@ class DeltaNeutralOrchestrator:
                 # Default to 4 decimals if not using USDT sizing
                 display_precision = 4
                 display_multiplier = 10000
+                base_amount_decimal = base_amount / display_multiplier
+                actual_notional_usd = base_amount_decimal * mid_price
             
             logger.info(f"Executing delta neutral trade on {market_symbol}:")
             logger.info(f"  Base amount: {base_amount / display_multiplier:.{display_precision}f} {market_symbol.split('-')[0]}")
@@ -462,6 +571,9 @@ class DeltaNeutralOrchestrator:
             logger.info(f"  Spread: ${spread:.2f} ({spread_percentage:.3f}%)")
             logger.info(f"  Long leverage: {leverage_long}x | Short leverage: {leverage_short}x")
             
+            # Snapshot balances before submitting orders
+            pre_trade_balances = await self._fetch_account_balances()
+
             # Prepare account configurations
             account1_config = {
                 'base_url': self.config.base_url,
@@ -540,7 +652,12 @@ class DeltaNeutralOrchestrator:
                 # Update market stats
                 self.market_stats[selected_market]['trades'] += 1
                 self.market_stats[selected_market]['successful'] += 1
-                
+                self._record_trade_execution(
+                    selected_market,
+                    base_amount_decimal,
+                    actual_notional_usd,
+                )
+
                 # Schedule position closing
                 close_delay = random.randint(self.config.min_close_delay, self.config.max_close_delay)
                 close_time = asyncio.get_event_loop().time() + close_delay
@@ -548,26 +665,32 @@ class DeltaNeutralOrchestrator:
                     'market_index': selected_market,
                     'market_symbol': market_symbol,
                     'base_amount': base_amount,
+                    'base_amount_decimal': base_amount_decimal,
+                    'notional': actual_notional_usd,
                     'close_time': close_time,
                     'next_retry_time': close_time,
                     'close_delay': close_delay,
                     'trade_number': self.trade_count,
                     'close_failures': 0,
                     'long_closed': False,
-                    'short_closed': False
+                    'short_closed': False,
+                    'pre_trade_balances': pre_trade_balances,
                 }
                 self.open_positions.append(position_info)
-                
+
                 logger.info(f"✅ Delta neutral trade executed successfully on {market_symbol}")
                 logger.info(f"📅 Position will close in {close_delay} seconds")
+                self._log_session_summary("Session stats after open")
                 return True, "Success"
             else:
                 # Update market stats for failed trade
                 self.market_stats[selected_market]['trades'] += 1
+                self._log_session_summary("Session stats after failed trade")
                 return False, f"One or both orders failed for {market_symbol}"
-                
+
         except Exception as e:
             logger.error(f"Error executing trade: {e}")
+            self._log_session_summary("Session stats after exception")
             return False, str(e)
     
     async def close_positions_task(self):
@@ -612,6 +735,7 @@ class DeltaNeutralOrchestrator:
                             pos['short_closed'] = True
 
                         if pos.get('long_closed') and pos.get('short_closed'):
+                            await self._finalize_trade(pos)
                             logger.info(
                                 "✅ Successfully closed both legs for Trade #%s",
                                 pos['trade_number']
@@ -954,7 +1078,15 @@ class DeltaNeutralOrchestrator:
                     if stats['trades'] > 0:
                         success_rate = (stats['successful'] / stats['trades'] * 100) if stats['trades'] > 0 else 0
                         logger.info(f"  Market {market_id}: {stats['successful']}/{stats['trades']} trades ({success_rate:.1f}% success)")
-            
+                        logger.info(
+                            "    Totals -> notional=$%.2f | long_volume=%.6f | short_volume=%.6f | bleed=$%.2f",
+                            stats['notional'],
+                            stats['volume_long'],
+                            stats['volume_short'],
+                            stats['bleed'],
+                        )
+
+            self._log_session_summary("Final session stats")
             logger.info("Bot stopped")
 
 
