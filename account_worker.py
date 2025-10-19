@@ -10,6 +10,8 @@ import asyncio
 import sys
 import json
 from dotenv import load_dotenv
+from typing import Optional, Tuple
+
 import lighter
 
 load_dotenv()
@@ -42,7 +44,9 @@ class SingleAccountWorker:
             print(f"Error initializing worker: {e}", file=sys.stderr)
             return False
     
-    async def update_leverage(self, market_index: int, leverage: int, margin_mode: int) -> bool:
+    async def update_leverage(
+        self, market_index: int, leverage: int, margin_mode: int
+    ) -> Tuple[bool, Optional[str]]:
         """
         Update leverage settings for the account.
         
@@ -52,23 +56,23 @@ class SingleAccountWorker:
             margin_mode: 0 for cross, 1 for isolated
             
         Returns:
-            True if successful
+            Tuple of (success flag, optional error message)
         """
         try:
             if self.leverage_updated:
-                return True
-                
+                return True, None
+
             await self.client.update_leverage(
                 market_index=market_index,
                 margin_mode=margin_mode,
                 leverage=leverage
             )
-            
+
             self.leverage_updated = True
-            return True
+            return True, None
         except Exception as e:
             print(f"Warning: Could not update leverage: {e}", file=sys.stderr)
-            return True  # Continue with default leverage
+            return False, str(e)
     
     async def execute_true_market_order(self, order_params: dict) -> dict:
         """
@@ -131,12 +135,18 @@ async def main():
     command = config.get('command')
     
     if command == 'update_leverage':
-        await worker.update_leverage(
+        success, error = await worker.update_leverage(
             market_index=config['leverage']['market_index'],
             leverage=config['leverage']['leverage'],
             margin_mode=config['leverage']['margin_mode']
         )
-        result = {'success': True, 'message': 'Leverage updated'}
+        if success:
+            result = {'success': True, 'message': 'Leverage updated'}
+        else:
+            result = {
+                'success': False,
+                'error': error or 'Failed to update leverage'
+            }
     elif command == 'execute_true_market_order':
         result = await worker.execute_true_market_order(config['order'])
     else:

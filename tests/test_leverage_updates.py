@@ -48,6 +48,24 @@ def test_update_leverage_both_accounts_success():
     assert orchestrator.run_worker_command.await_count == 2
 
 
+def test_update_leverage_both_accounts_failure_response_blocks_trading():
+    orchestrator = DeltaNeutralOrchestrator(make_config())
+    orchestrator.run_worker_command = AsyncMock(
+        side_effect=[
+            {"success": False, "error": "could not update leverage"},
+            {"success": True},
+        ]
+    )
+
+    with pytest.raises(RuntimeError, match="update leverage on both accounts") as exc_info:
+        asyncio.run(
+            orchestrator.update_leverage_both_accounts(leverage=3, market_index=2)
+        )
+
+    assert "could not update leverage" in str(exc_info.value)
+    assert orchestrator.run_worker_command.await_count == 2
+
+
 def test_update_leverage_both_accounts_exception_blocks_trading():
     orchestrator = DeltaNeutralOrchestrator(make_config())
     orchestrator.run_worker_command = AsyncMock(
