@@ -7,12 +7,16 @@ This isolation prevents signer conflicts when managing multiple accounts.
 """
 
 import asyncio
-import sys
 import json
-from dotenv import load_dotenv
+import logging
+import sys
 from typing import Optional, Tuple
 
+from dotenv import load_dotenv
+
 import lighter
+
+logger = logging.getLogger(__name__)
 
 load_dotenv()
 
@@ -23,7 +27,7 @@ class SingleAccountWorker:
     def __init__(self, account_config: dict):
         self.config = account_config
         self.client = None
-        self.leverage_updated = False
+        self._last_leverage_request: Optional[Tuple[int, int, int]] = None
         
     async def initialize(self) -> bool:
         """
@@ -59,7 +63,16 @@ class SingleAccountWorker:
             Tuple of (success flag, optional error message)
         """
         try:
-            if self.leverage_updated:
+            last_request = self._last_leverage_request
+            current_request = (market_index, leverage, margin_mode)
+
+            if last_request == current_request:
+                logger.info(
+                    "Skipping leverage update for market %s: leverage=%s margin_mode=%s unchanged",
+                    market_index,
+                    leverage,
+                    margin_mode,
+                )
                 return True, None
 
             await self.client.update_leverage(
@@ -68,7 +81,13 @@ class SingleAccountWorker:
                 leverage=leverage
             )
 
-            self.leverage_updated = True
+            self._last_leverage_request = current_request
+            logger.info(
+                "Updated leverage for market %s: leverage=%s margin_mode=%s",
+                market_index,
+                leverage,
+                margin_mode,
+            )
             return True, None
         except Exception as e:
             print(f"Warning: Could not update leverage: {e}", file=sys.stderr)
