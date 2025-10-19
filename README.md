@@ -1137,6 +1137,10 @@ For issues related to:
 - **This Bot**: Review logs and configuration
 - **Docker**: Ensure Docker is properly installed
 
+### Spread Guard
+
+- `MAX_SPREAD_PERCENT` sets the maximum allowed bid/ask spread (in percent) before a trade is skipped. The default of `0.1` blocks trades when the spread is wider than 0.1% to avoid executing in illiquid order books.
+
 ## ⚠️ Disclaimer
 
 This bot is for educational and volume generation purposes. Use at your own risk:

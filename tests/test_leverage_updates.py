@@ -21,6 +21,7 @@ def make_config() -> BotConfig:
         base_amount=1,
         base_amount_in_usdt=None,
         max_slippage=0.01,
+        max_spread_percent=0.1,
         leverage=5,
         use_dynamic_leverage=False,
         leverage_buffer=0,

@@ -621,7 +621,7 @@ class DeltaNeutralOrchestrator:
             # --- PRE-TRADE SAFEGUARD: Check Bid-Ask Spread ---
             spread = best_ask - best_bid
             spread_percentage = (spread / best_ask) * 100
-            max_spread_percentage = 0.1  # Allow up to 0.1% spread
+            max_spread_percentage = self.config.max_spread_percent
 
             if spread_percentage > max_spread_percentage:
                 logger.warning(f"Spread ({spread_percentage:.4f}%) exceeds max ({max_spread_percentage}%) - skipping trade")
