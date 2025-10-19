@@ -138,6 +138,24 @@ USE_DYNAMIC_LEVERAGE=true
 
 
 
+### Safety Floors
+
+Set optional guard rails to halt trading if available balances fall too low:
+
+```env
+# Stop if Account 1 drops below $250
+MIN_ACCOUNT1_BALANCE=250
+
+# Stop if Account 2 drops below $250 (leave blank to disable)
+MIN_ACCOUNT2_BALANCE=
+
+# Or enforce a combined floor across both accounts
+MIN_COMBINED_BALANCE=600
+```
+
+All thresholds must be non-negative. When triggered the bot logs a critical alert, stops opening new trades, and lets existing positions settle.
+
+
 ```powershell- Sufficient balance in both accounts for trading
 
 python check_balances.py
