@@ -5,6 +5,15 @@ Test script to verify market whitelist functionality
 
 import asyncio
 import sys
+
+try:
+    import pytest
+    pytestmark = pytest.mark.skip(
+        "test_market_whitelist is an integration script and not part of automated pytest suite"
+    )
+except ImportError:  # pragma: no cover - pytest not available in script mode
+    pytest = None
+
 from dotenv import load_dotenv
 from config import BotConfig
 

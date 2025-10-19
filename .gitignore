@@ -40,6 +40,7 @@ htmlcov/
 test_*.py
 !test_market_whitelist.py
 !tests/test_leverage_updates.py
+!tests/test_slippage_pricing.py
 
 # Personal notes
 notes.txt
