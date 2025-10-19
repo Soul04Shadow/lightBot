@@ -346,8 +346,53 @@ class DeltaNeutralOrchestrator:
             
             # Get current bid and ask for the selected market
             best_bid, best_ask = await self.get_current_price(selected_market)
-            if not best_bid or not best_ask:
+            if best_bid is None and best_ask is None:
                 return False, f"Failed to get current price for {market_symbol}"
+
+            if best_bid is None or best_bid <= 0:
+                if best_ask is not None and best_ask > 0:
+                    logger.warning(
+                        "Best bid missing or invalid for %s; falling back to best ask %.6f",
+                        market_symbol,
+                        best_ask,
+                    )
+                    best_bid = best_ask
+                else:
+                    logger.warning(
+                        "Unable to determine valid best bid for %s (value: %s)",
+                        market_symbol,
+                        best_bid,
+                    )
+                    return False, f"Failed to get valid best bid for {market_symbol}"
+
+            if best_ask is None or best_ask <= 0:
+                if best_bid is not None and best_bid > 0:
+                    logger.warning(
+                        "Best ask missing or invalid for %s; falling back to best bid %.6f",
+                        market_symbol,
+                        best_bid,
+                    )
+                    best_ask = best_bid
+                else:
+                    logger.warning(
+                        "Unable to determine valid best ask for %s (value: %s)",
+                        market_symbol,
+                        best_ask,
+                    )
+                    return False, f"Failed to get valid best ask for {market_symbol}"
+
+            max_slippage = self.config.max_slippage
+            long_execution_price = best_ask * (1 + max_slippage)
+            short_execution_price = best_bid * (1 - max_slippage)
+
+            if long_execution_price <= 0 or short_execution_price <= 0:
+                logger.warning(
+                    "Computed execution prices invalid for %s (long: %s, short: %s)",
+                    market_symbol,
+                    long_execution_price,
+                    short_execution_price,
+                )
+                return False, f"Invalid execution prices for {market_symbol}"
 
             # --- PRE-TRADE SAFEGUARD: Check Bid-Ask Spread ---
             spread = best_ask - best_bid
@@ -434,9 +479,6 @@ class DeltaNeutralOrchestrator:
             # For a true market order, we set a very wide price boundary.
             # For a buy order, we set a very high price.
             # For a sell order, we set a very low price (e.g., 1).
-            long_execution_price = 999999999
-            short_execution_price = 1
-
             long_command = {
                 'command': 'execute_true_market_order',
                 'order': {
@@ -447,7 +489,7 @@ class DeltaNeutralOrchestrator:
                     'execution_price': long_execution_price
                 }
             }
-            
+
             short_command = {
                 'command': 'execute_true_market_order',
                 'order': {
@@ -458,6 +500,13 @@ class DeltaNeutralOrchestrator:
                     'execution_price': short_execution_price
                 }
             }
+
+            logger.info(
+                "  Execution limits -> Long buy ≤ $%.6f | Short sell ≥ $%.6f (max slippage %.2f%%)",
+                long_execution_price,
+                short_execution_price,
+                max_slippage * 100,
+            )
             
             # Execute both orders in parallel using isolated workers
             results = await asyncio.gather(
@@ -640,9 +689,99 @@ class DeltaNeutralOrchestrator:
                 'api_key_index': self.config.account2_api_key_index,
             }
 
-            # To close positions, we use true market orders with wide boundaries
-            close_long_execution_price = 1  # Sell to close long (accept any price)
-            close_short_execution_price = 999999999  # Buy to close short (accept any price)
+            best_bid, best_ask = await self.get_current_price(market_index)
+
+            if close_long and (best_bid is None or best_bid <= 0):
+                if best_ask is not None and best_ask > 0:
+                    logger.warning(
+                        "Best bid missing or invalid for %s while closing long; using ask %.6f",
+                        market_symbol,
+                        best_ask,
+                    )
+                    best_bid = best_ask
+                else:
+                    logger.warning(
+                        "Unable to determine valid best bid for %s when closing long (value: %s)",
+                        market_symbol,
+                        best_bid,
+                    )
+                    return {
+                        'long_success': False,
+                        'short_success': False,
+                        'long_result': {'success': False, 'error': 'Invalid best bid'},
+                        'short_result': {'success': False, 'error': 'Invalid best bid'},
+                    }
+
+            if close_short and (best_ask is None or best_ask <= 0):
+                if best_bid is not None and best_bid > 0:
+                    logger.warning(
+                        "Best ask missing or invalid for %s while closing short; using bid %.6f",
+                        market_symbol,
+                        best_bid,
+                    )
+                    best_ask = best_bid
+                else:
+                    logger.warning(
+                        "Unable to determine valid best ask for %s when closing short (value: %s)",
+                        market_symbol,
+                        best_ask,
+                    )
+                    return {
+                        'long_success': False,
+                        'short_success': False,
+                        'long_result': {'success': False, 'error': 'Invalid best ask'},
+                        'short_result': {'success': False, 'error': 'Invalid best ask'},
+                    }
+
+            max_slippage = self.config.max_slippage
+            close_long_execution_price = None
+            close_short_execution_price = None
+
+            if close_long:
+                close_long_execution_price = best_bid * (1 - max_slippage)
+                if close_long_execution_price <= 0:
+                    logger.warning(
+                        "Computed close price invalid for long leg on %s (price: %s)",
+                        market_symbol,
+                        close_long_execution_price,
+                    )
+                    return {
+                        'long_success': False,
+                        'short_success': False,
+                        'long_result': {'success': False, 'error': 'Invalid long close price'},
+                        'short_result': {'success': False, 'error': 'Invalid long close price'},
+                    }
+
+            if close_short:
+                close_short_execution_price = best_ask * (1 + max_slippage)
+                if close_short_execution_price <= 0:
+                    logger.warning(
+                        "Computed close price invalid for short leg on %s (price: %s)",
+                        market_symbol,
+                        close_short_execution_price,
+                    )
+                    return {
+                        'long_success': False,
+                        'short_success': False,
+                        'long_result': {'success': False, 'error': 'Invalid short close price'},
+                        'short_result': {'success': False, 'error': 'Invalid short close price'},
+                    }
+
+            if close_long or close_short:
+                limit_messages = []
+                if close_long:
+                    limit_messages.append(
+                        f"Long sell ≥ ${close_long_execution_price:.6f}"
+                    )
+                if close_short:
+                    limit_messages.append(
+                        f"Short buy ≤ ${close_short_execution_price:.6f}"
+                    )
+                logger.info(
+                    "  Close limits -> %s (max slippage %.2f%%)",
+                    " | ".join(limit_messages),
+                    max_slippage * 100,
+                )
 
             # Close commands
             close_long_command = {
@@ -653,7 +792,7 @@ class DeltaNeutralOrchestrator:
                     'is_ask': True,  # Sell to close long
                     'client_order_index': int(datetime.now().timestamp() * 1000 + 2) % 1000000,
                     'reduce_only': True,
-                    'execution_price': close_long_execution_price
+                    'execution_price': close_long_execution_price if close_long_execution_price is not None else 0
                 }
             }
 
@@ -665,7 +804,7 @@ class DeltaNeutralOrchestrator:
                     'is_ask': False, # Buy to close short
                     'client_order_index': int(datetime.now().timestamp() * 1000 + 3) % 1000000,
                     'reduce_only': True,
-                    'execution_price': close_short_execution_price
+                    'execution_price': close_short_execution_price if close_short_execution_price is not None else 0
                 }
             }
 
