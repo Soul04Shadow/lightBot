@@ -40,6 +40,7 @@ class BotConfig:
     base_amount: int
     base_amount_in_usdt: Optional[float]
     max_slippage: float
+    max_spread_percent: float
     leverage: int
     use_dynamic_leverage: bool
     leverage_buffer: int
@@ -107,6 +108,22 @@ class BotConfig:
 
             return value
 
+        def parse_percentage_env(key: str, default: str) -> float:
+            """Parse a percentage value stored as a float and ensure it's non-negative."""
+            raw_value = os.getenv(key)
+            if raw_value is None or raw_value.strip() == '':
+                raw_value = default
+
+            try:
+                value = float(raw_value)
+            except ValueError as exc:
+                raise ValueError(f"Environment variable {key} must be a number: {exc}")
+
+            if value < 0:
+                raise ValueError(f"Environment variable {key} must be non-negative")
+
+            return value
+
         market_index = int(get_optional_env('MARKET_INDEX', '0'))
         market_whitelist_str = get_optional_env('MARKET_WHITELIST', '')
         market_whitelist = parse_market_whitelist(market_whitelist_str, market_index)
@@ -124,6 +141,7 @@ class BotConfig:
             base_amount=int(get_optional_env('BASE_AMOUNT', '0')),
             base_amount_in_usdt=float(get_optional_env('BASE_AMOUNT_IN_USDT', '0')) or None,
             max_slippage=float(get_optional_env('MAX_SLIPPAGE', '0.02')),
+            max_spread_percent=parse_percentage_env('MAX_SPREAD_PERCENT', '0.1'),
             leverage=int(get_optional_env('LEVERAGE', '10')),
             use_dynamic_leverage=get_optional_env('USE_DYNAMIC_LEVERAGE', 'false').lower() == 'true',
             leverage_buffer=int(get_optional_env('LEVERAGE_BUFFER', '5')),

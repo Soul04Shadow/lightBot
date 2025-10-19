@@ -21,6 +21,7 @@ def make_config() -> BotConfig:
         base_amount=1000,
         base_amount_in_usdt=None,
         max_slippage=0.01,
+        max_spread_percent=0.1,
         leverage=5,
         use_dynamic_leverage=False,
         leverage_buffer=0,
@@ -77,6 +78,47 @@ def test_execute_trade_falls_back_when_missing_bid():
     assert success is True
     short_command = orchestrator.run_worker_command.await_args_list[1].args[1]
     assert short_command["order"]["execution_price"] == pytest.approx(50.0 * 0.99)
+
+
+def test_execute_trade_blocks_on_wide_spread():
+    config = make_config()
+    config.max_spread_percent = 0.05  # tighten guard to 0.05%
+    orchestrator = DeltaNeutralOrchestrator(config)
+    orchestrator.select_random_market = lambda: 1
+    orchestrator.config.get_market_info = AsyncMock(return_value={
+        "symbol": "BTC-USDT",
+        "max_leverage": 20,
+    })
+    orchestrator.get_current_price = AsyncMock(return_value=(100.0, 100.2))
+    orchestrator.run_worker_command = AsyncMock()
+    orchestrator._get_balances = AsyncMock(return_value=((1000.0, 1000.0), True))
+
+    success, message = asyncio.run(orchestrator.execute_delta_neutral_trade())
+
+    assert success is False
+    assert "Spread too wide" in message
+    orchestrator.run_worker_command.assert_not_awaited()
+
+
+def test_execute_trade_respects_custom_spread_threshold():
+    config = make_config()
+    config.max_spread_percent = 0.5  # allow up to 0.5%
+    orchestrator = DeltaNeutralOrchestrator(config)
+    orchestrator.select_random_market = lambda: 1
+    orchestrator.config.get_market_info = AsyncMock(return_value={
+        "symbol": "BTC-USDT",
+        "max_leverage": 20,
+    })
+    orchestrator.get_current_price = AsyncMock(return_value=(100.0, 100.2))
+    orchestrator.run_worker_command = AsyncMock(
+        side_effect=[{"success": True}, {"success": True}]
+    )
+    orchestrator._get_balances = AsyncMock(return_value=((1000.0, 1000.0), True))
+
+    success, _ = asyncio.run(orchestrator.execute_delta_neutral_trade())
+
+    assert success is True
+    assert orchestrator.run_worker_command.await_count == 2
 
 
 def test_execute_trade_aborts_on_zero_prices():
