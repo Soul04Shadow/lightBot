@@ -11,7 +11,7 @@ import logging
 import random
 import sys
 from datetime import datetime
-from typing import Optional, Tuple, Sequence, Any
+from typing import Optional, Tuple, Sequence, Any, Dict
 from dotenv import load_dotenv
 import lighter
 from config import BotConfig
@@ -43,8 +43,11 @@ class DeltaNeutralOrchestrator:
         self.success_count = 0
         self.is_running = False
         self.open_positions = []
+        self.close_retry_backoff_seconds = 5
+        self.max_close_retries = 3
+        self.close_failure_alert_active = False
         self.market_stats = {
-            market_id: {'trades': 0, 'successful': 0} 
+            market_id: {'trades': 0, 'successful': 0}
             for market_id in config.market_whitelist
         }
     
@@ -487,13 +490,18 @@ class DeltaNeutralOrchestrator:
                 
                 # Schedule position closing
                 close_delay = random.randint(self.config.min_close_delay, self.config.max_close_delay)
+                close_time = asyncio.get_event_loop().time() + close_delay
                 position_info = {
                     'market_index': selected_market,
                     'market_symbol': market_symbol,
                     'base_amount': base_amount,
-                    'close_time': asyncio.get_event_loop().time() + close_delay,
+                    'close_time': close_time,
+                    'next_retry_time': close_time,
                     'close_delay': close_delay,
-                    'trade_number': self.trade_count
+                    'trade_number': self.trade_count,
+                    'close_failures': 0,
+                    'long_closed': False,
+                    'short_closed': False
                 }
                 self.open_positions.append(position_info)
                 
@@ -516,37 +524,104 @@ class DeltaNeutralOrchestrator:
                 current_time = asyncio.get_event_loop().time()
                 positions_to_close = []
                 remaining_positions = []
-                
+
                 for pos in self.open_positions:
-                    if current_time >= pos['close_time']:
+                    next_retry_time = pos.get('next_retry_time', pos.get('close_time', 0))
+                    if next_retry_time is None:
+                        next_retry_time = pos.get('close_time', 0)
+                    if current_time >= next_retry_time:
                         positions_to_close.append(pos)
                     else:
                         remaining_positions.append(pos)
-                
+
                 # Close positions that are ready
                 if positions_to_close:
+                    retry_positions = []
                     for pos in positions_to_close:
                         market_symbol = pos.get('market_symbol', f'Market {pos["market_index"]}')
                         logger.info(f"\n{'='*60}")
                         logger.info(f"Closing positions from Trade #{pos['trade_number']} - {market_symbol}")
                         logger.info(f"{'='*60}")
-                        await self.close_position_pair(
+                        close_result = await self.close_position_pair(
                             pos['market_index'],
                             pos['base_amount'],
-                            market_symbol
+                            market_symbol,
+                            close_long=not pos.get('long_closed', False),
+                            close_short=not pos.get('short_closed', False)
                         )
-                    
+
+                        long_success = close_result.get('long_success', False)
+                        short_success = close_result.get('short_success', False)
+
+                        if long_success:
+                            pos['long_closed'] = True
+                        if short_success:
+                            pos['short_closed'] = True
+
+                        if pos.get('long_closed') and pos.get('short_closed'):
+                            logger.info(
+                                "✅ Successfully closed both legs for Trade #%s",
+                                pos['trade_number']
+                            )
+                            pos['close_failures'] = 0
+                            pos['next_retry_time'] = None
+                        else:
+                            failure_count = pos.get('close_failures', 0) + 1
+                            pos['close_failures'] = failure_count
+                            backoff_seconds = self.close_retry_backoff_seconds * max(1, failure_count)
+                            pos['next_retry_time'] = asyncio.get_event_loop().time() + backoff_seconds
+                            retry_positions.append(pos)
+
+                            logger.warning(
+                                "Retrying Trade #%s in %ss (attempt %s) due to close failure",
+                                pos['trade_number'],
+                                backoff_seconds,
+                                failure_count,
+                            )
+
+                            if failure_count >= self.max_close_retries:
+                                if not self.close_failure_alert_active:
+                                    logger.error(
+                                        "🚨 Trade #%s failed to close after %s attempts. Manual intervention required before"
+                                        " continuing new trades.",
+                                        pos['trade_number'],
+                                        failure_count,
+                                    )
+                                self.close_failure_alert_active = True
+
                     # Only update the list after closing is complete
-                    self.open_positions = remaining_positions
-                
+                    self.open_positions = remaining_positions + retry_positions
+
+                    if self.close_failure_alert_active:
+                        if not any(
+                            p.get('close_failures', 0) >= self.max_close_retries
+                            for p in self.open_positions
+                        ):
+                            self.close_failure_alert_active = False
+                            logger.info("✅ Close failure alert cleared after successful retries.")
+
                 await asyncio.sleep(1)  # Check every second
-                
+
             except Exception as e:
                 logger.error(f"Error in close positions task: {e}")
                 await asyncio.sleep(5)
     
-    async def close_position_pair(self, market_index: int, base_amount: int, market_symbol: str = None):
-        """Close both long and short positions for a specific market"""
+    async def close_position_pair(
+        self,
+        market_index: int,
+        base_amount: int,
+        market_symbol: str = None,
+        close_long: bool = True,
+        close_short: bool = True
+    ) -> Dict[str, Any]:
+        """Close both long and short positions for a specific market.
+
+        Returns structured results for both legs so the caller can
+        determine retry/escalation strategy.
+        """
+        long_close_result: Any = {'success': False}
+        short_close_result: Any = {'success': False}
+
         try:
             if market_symbol is None:
                 market_symbol = f"Market {market_index}"
@@ -557,7 +632,7 @@ class DeltaNeutralOrchestrator:
                 'account_index': self.config.account1_index,
                 'api_key_index': self.config.account1_api_key_index,
             }
-            
+
             account2_config = {
                 'base_url': self.config.base_url,
                 'private_key': self.config.account2_private_key,
@@ -581,7 +656,7 @@ class DeltaNeutralOrchestrator:
                     'execution_price': close_long_execution_price
                 }
             }
-            
+
             close_short_command = {
                 'command': 'execute_true_market_order',
                 'order': {
@@ -593,44 +668,71 @@ class DeltaNeutralOrchestrator:
                     'execution_price': close_short_execution_price
                 }
             }
-            
+
             # Close positions sequentially to avoid SDK race conditions
             # (parallel closing sometimes triggers SDK bugs)
-            long_close_result = await self.run_worker_command(account1_config, close_long_command)
-            await asyncio.sleep(0.5)  # Small delay to avoid SDK issues
-            short_close_result = await self.run_worker_command(account2_config, close_short_command)
-            
-            results = [long_close_result, short_close_result]
-            
-            long_close, short_close = results
-            
+            if close_long:
+                long_close_result = await self.run_worker_command(account1_config, close_long_command)
+            else:
+                long_close_result = {'success': True, 'skipped': True}
+
+            if close_short and close_long:
+                await asyncio.sleep(0.5)  # Small delay to avoid SDK issues when both legs run
+
+            if close_short:
+                short_close_result = await self.run_worker_command(account2_config, close_short_command)
+            else:
+                short_close_result = {'success': True, 'skipped': True}
+
+            long_success = (
+                isinstance(long_close_result, dict) and long_close_result.get('success')
+            ) or (not close_long)
+            short_success = (
+                isinstance(short_close_result, dict) and short_close_result.get('success')
+            ) or (not close_short)
+
             # Log results with better error reporting
-            if isinstance(long_close, dict) and long_close.get('success'):
-                tx_hash = long_close.get('tx_hash', 'N/A')
-                logger.info(f"✅ Closed long position (Account 1): TX {tx_hash[:16]}...")
-            else:
-                error_msg = 'Unknown error'
-                if isinstance(long_close, dict):
-                    error_msg = long_close.get('error') or long_close.get('message', 'Unknown')
-                elif isinstance(long_close, Exception):
-                    error_msg = str(long_close)
-                logger.warning(f"⚠️  Long position close: {error_msg}")
-            
-            if isinstance(short_close, dict) and short_close.get('success'):
-                tx_hash = short_close.get('tx_hash', 'N/A')
-                logger.info(f"✅ Closed short position (Account 2): TX {tx_hash[:16]}...")
-            else:
-                error_msg = 'Unknown error'
-                if isinstance(short_close, dict):
-                    error_msg = short_close.get('error') or short_close.get('message', 'Unknown')
-                    if 'traceback' in short_close:
-                        logger.error(f"Traceback:\n{short_close['traceback']}")
-                elif isinstance(short_close, Exception):
-                    error_msg = str(short_close)
-                logger.warning(f"⚠️  Short position close: {error_msg}")
-                
+            if close_long:
+                if long_success:
+                    tx_hash = long_close_result.get('tx_hash', 'N/A')
+                    logger.info(f"✅ Closed long position (Account 1): TX {tx_hash[:16]}...")
+                else:
+                    error_msg = 'Unknown error'
+                    if isinstance(long_close_result, dict):
+                        error_msg = long_close_result.get('error') or long_close_result.get('message', 'Unknown')
+                    elif isinstance(long_close_result, Exception):
+                        error_msg = str(long_close_result)
+                    logger.warning(f"⚠️  Long position close: {error_msg}")
+
+            if close_short:
+                if short_success:
+                    tx_hash = short_close_result.get('tx_hash', 'N/A')
+                    logger.info(f"✅ Closed short position (Account 2): TX {tx_hash[:16]}...")
+                else:
+                    error_msg = 'Unknown error'
+                    if isinstance(short_close_result, dict):
+                        error_msg = short_close_result.get('error') or short_close_result.get('message', 'Unknown')
+                        if 'traceback' in short_close_result:
+                            logger.error(f"Traceback:\n{short_close_result['traceback']}")
+                    elif isinstance(short_close_result, Exception):
+                        error_msg = str(short_close_result)
+                    logger.warning(f"⚠️  Short position close: {error_msg}")
+
+            return {
+                'long_success': bool(long_success),
+                'short_success': bool(short_success),
+                'long_result': long_close_result,
+                'short_result': short_close_result,
+            }
+
         except Exception as e:
             logger.error(f"Error closing positions: {e}")
+            return {
+                'long_success': False,
+                'short_success': False,
+                'long_result': {'success': False, 'error': str(e)},
+                'short_result': {'success': False, 'error': str(e)},
+            }
     
     async def run_continuous(self):
         """Run continuous trading with configured interval"""
@@ -647,8 +749,15 @@ class DeltaNeutralOrchestrator:
         
         try:
             while self.is_running:
+                if self.close_failure_alert_active:
+                    logger.error(
+                        "⏸️  Close position retries exceeded threshold. Pausing new trades until manual intervention."
+                    )
+                    await asyncio.sleep(5)
+                    continue
+
                 self.trade_count += 1
-                
+
                 logger.info(f"\n{'='*60}")
                 logger.info(f"Trade #{self.trade_count}")
                 logger.info(f"{'='*60}")
