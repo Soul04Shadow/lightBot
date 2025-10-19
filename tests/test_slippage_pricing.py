@@ -32,6 +32,7 @@ def make_config() -> BotConfig:
         max_close_delay=0,
         max_trades=0,
         use_batch_mode=False,
+        market_metadata_ttl_seconds=300,
     )
 
 

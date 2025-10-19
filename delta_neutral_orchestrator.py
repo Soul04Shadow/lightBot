@@ -92,23 +92,27 @@ class DeltaNeutralOrchestrator:
         Returns:
             Number of decimal places for base amount
         """
+        cached_decimals = self.config.get_cached_size_decimals(market_id)
+        if cached_decimals is not None:
+            return cached_decimals
+
         try:
-            configuration = lighter.Configuration(self.config.base_url)
-            api_client = lighter.ApiClient(configuration)
-            order_api = lighter.OrderApi(api_client)
-            
-            order_book_details = await order_api.order_book_details(market_id=market_id)
-            await api_client.close()
-            
+            logger.info("Refreshing size decimals for market %s from API", market_id)
+            async with self.config.api_client() as api_client:
+                order_api = lighter.OrderApi(api_client)
+                order_book_details = await order_api.order_book_details(market_id=market_id)
+
             if order_book_details.order_book_details:
                 for detail in order_book_details.order_book_details:
                     if detail.market_id == market_id:
+                        self.config.cache_size_decimals(market_id, detail.size_decimals)
+                        logger.info("Cached size decimals for market %s", market_id)
                         return detail.size_decimals
-            
+
             # Fallback if not found
             logger.warning(f"Could not find size_decimals for market {market_id}, using fallback")
             return self._fallback_precision(fallback_price)
-            
+
         except Exception as e:
             logger.warning(f"Error fetching market precision: {e}, using fallback")
             return self._fallback_precision(fallback_price)

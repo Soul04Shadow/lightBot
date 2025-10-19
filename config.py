@@ -5,10 +5,16 @@ Handles loading, validation, and management of bot configuration
 from environment variables.
 """
 
+import logging
 import os
-from dataclasses import dataclass
-from typing import Optional
+import time
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
+from typing import Any, Dict, Optional, Tuple
+
 import lighter
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -47,6 +53,10 @@ class BotConfig:
     max_close_delay: int
     max_trades: int
     use_batch_mode: bool
+    market_metadata_ttl_seconds: int
+
+    _market_info_cache: Dict[int, Tuple[dict, float]] = field(default_factory=dict, init=False, repr=False)
+    _size_decimal_cache: Dict[int, Tuple[int, float]] = field(default_factory=dict, init=False, repr=False)
     
     @classmethod
     def from_env(cls) -> 'BotConfig':
@@ -106,7 +116,59 @@ class BotConfig:
             max_close_delay=int(get_optional_env('MAX_CLOSE_DELAY', '50')),
             max_trades=int(get_optional_env('MAX_TRADES', '0')),
             use_batch_mode=get_optional_env('USE_BATCH_MODE', 'false').lower() == 'true',
+            market_metadata_ttl_seconds=int(get_optional_env('MARKET_METADATA_TTL_SECONDS', '300')),
         )
+
+    def _current_time(self) -> float:
+        """Return the current time for cache bookkeeping."""
+        return time.time()
+
+    def _is_cache_valid(self, timestamp: float) -> bool:
+        return (self._current_time() - timestamp) < self.market_metadata_ttl_seconds
+
+    def get_cached_market_info(self, market_id: int) -> Optional[dict]:
+        entry = self._market_info_cache.get(market_id)
+        if not entry:
+            return None
+
+        info, timestamp = entry
+        if self._is_cache_valid(timestamp):
+            logger.info("Using cached market info for market %s", market_id)
+            return info
+
+        logger.info("Cached market info for market %s expired; refreshing", market_id)
+        self._market_info_cache.pop(market_id, None)
+        return None
+
+    def cache_market_info(self, market_id: int, info: dict) -> None:
+        self._market_info_cache[market_id] = (info, self._current_time())
+
+    def get_cached_size_decimals(self, market_id: int) -> Optional[int]:
+        entry = self._size_decimal_cache.get(market_id)
+        if not entry:
+            return None
+
+        decimals, timestamp = entry
+        if self._is_cache_valid(timestamp):
+            logger.info("Using cached size decimals for market %s", market_id)
+            return decimals
+
+        logger.info("Cached size decimals for market %s expired; refreshing", market_id)
+        self._size_decimal_cache.pop(market_id, None)
+        return None
+
+    def cache_size_decimals(self, market_id: int, decimals: int) -> None:
+        self._size_decimal_cache[market_id] = (decimals, self._current_time())
+
+    @asynccontextmanager
+    async def api_client(self):
+        """Yield a Lighter API client and ensure it is closed properly."""
+        configuration = lighter.Configuration(self.base_url)
+        api_client = lighter.ApiClient(configuration)
+        try:
+            yield api_client
+        finally:
+            await api_client.close()
     
     async def get_market_max_leverage(self, market_id: Optional[int] = None) -> int:
         """
@@ -159,25 +221,30 @@ class BotConfig:
         Returns:
             Dictionary with market info: {'market_id', 'symbol', 'max_leverage'}
         """
+        cached_info = self.get_cached_market_info(market_id)
+        if cached_info is not None:
+            return cached_info
+
         try:
-            configuration = lighter.Configuration(self.base_url)
-            api_client = lighter.ApiClient(configuration)
-            order_api = lighter.OrderApi(api_client)
-            
-            order_book_details = await order_api.order_book_details(market_id=market_id)
-            await api_client.close()
-            
+            logger.info("Refreshing market info for market %s from API", market_id)
+            async with self.api_client() as api_client:
+                order_api = lighter.OrderApi(api_client)
+                order_book_details = await order_api.order_book_details(market_id=market_id)
+
             if order_book_details.order_book_details:
                 for detail in order_book_details.order_book_details:
                     if detail.market_id == market_id:
                         min_margin_fraction = detail.min_initial_margin_fraction / 10000.0
                         max_leverage = int(1.0 / min_margin_fraction)
-                        return {
+                        info = {
                             'market_id': market_id,
                             'symbol': detail.symbol,
                             'max_leverage': max_leverage
                         }
-                
+                        self.cache_market_info(market_id, info)
+                        logger.info("Cached market info for market %s", market_id)
+                        return info
+
                 raise ValueError(f"Market {market_id} not found")
             else:
                 raise ValueError("No order book details returned from API")
@@ -350,4 +417,5 @@ EXAMPLE_CONFIG = {
     'max_close_delay': 50,
     'max_trades': 0,  # Unlimited
     'use_batch_mode': False,
+    'market_metadata_ttl_seconds': 300,
 }
