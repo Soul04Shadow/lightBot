@@ -47,6 +47,7 @@ def test_execute_trade_uses_slippage_limits():
     orchestrator.run_worker_command = AsyncMock(
         side_effect=[{"success": True}, {"success": True}]
     )
+    orchestrator._get_balances = AsyncMock(return_value=((1000.0, 1000.0), True))
 
     success, _ = asyncio.run(orchestrator.execute_delta_neutral_trade())
 
@@ -69,6 +70,7 @@ def test_execute_trade_falls_back_when_missing_bid():
     orchestrator.run_worker_command = AsyncMock(
         side_effect=[{"success": True}, {"success": True}]
     )
+    orchestrator._get_balances = AsyncMock(return_value=((1000.0, 1000.0), True))
 
     success, _ = asyncio.run(orchestrator.execute_delta_neutral_trade())
 
@@ -86,6 +88,7 @@ def test_execute_trade_aborts_on_zero_prices():
     })
     orchestrator.get_current_price = AsyncMock(return_value=(0.0, 0.0))
     orchestrator.run_worker_command = AsyncMock()
+    orchestrator._get_balances = AsyncMock(return_value=((1000.0, 1000.0), True))
 
     success, message = asyncio.run(orchestrator.execute_delta_neutral_trade())
 

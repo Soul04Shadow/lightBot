@@ -61,7 +61,10 @@ class DeltaNeutralOrchestrator:
         self.total_volume_long = 0.0
         self.total_volume_short = 0.0
         self.realized_bleed = 0.0
-    
+        self._cached_balances: Tuple[Optional[float], Optional[float]] = (None, None)
+        self._last_balance_poll_time: float = 0.0
+        self._balance_poll_interval_seconds: float = 30.0
+
     def select_random_market(self) -> int:
         """Randomly select a market from the whitelist"""
         return random.choice(self.config.market_whitelist)
@@ -120,6 +123,111 @@ class DeltaNeutralOrchestrator:
             logger.warning("Failed to fetch account balances: %s", exc)
 
         return None, None
+
+    def _format_balance(self, value: Optional[float]) -> str:
+        return f"${value:.2f}" if value is not None else "N/A"
+
+    def _log_balance_snapshot(self, balances: Tuple[Optional[float], Optional[float]], context: str) -> None:
+        account1, account2 = balances
+        logger.info(
+            "📊 Balance snapshot (%s) -> Account 1: %s | Account 2: %s",
+            context,
+            self._format_balance(account1),
+            self._format_balance(account2),
+        )
+
+    def _balances_meet_thresholds(self, balances: Tuple[Optional[float], Optional[float]], context: str) -> bool:
+        account1, account2 = balances
+        breaches = []
+
+        if self.config.min_account1_balance is not None and account1 is not None:
+            if account1 < self.config.min_account1_balance:
+                breaches.append(
+                    f"Account 1 ${account1:.2f} < floor ${self.config.min_account1_balance:.2f}"
+                )
+
+        if self.config.min_account2_balance is not None and account2 is not None:
+            if account2 < self.config.min_account2_balance:
+                breaches.append(
+                    f"Account 2 ${account2:.2f} < floor ${self.config.min_account2_balance:.2f}"
+                )
+
+        if self.config.min_combined_balance is not None:
+            if account1 is None or account2 is None:
+                logger.warning(
+                    "Unable to validate combined balance floor (%s) because one or more balances are unknown",
+                    context,
+                )
+            else:
+                combined = account1 + account2
+                if combined < self.config.min_combined_balance:
+                    breaches.append(
+                        f"Combined ${combined:.2f} < floor ${self.config.min_combined_balance:.2f}"
+                    )
+
+        if breaches:
+            logger.critical(
+                "🚨 Balance floor breached during %s -> %s. Halting new trades.",
+                context,
+                '; '.join(breaches),
+            )
+            self.is_running = False
+            return False
+
+        return True
+
+    async def _get_balances(
+        self,
+        *,
+        force_refresh: bool = False,
+    ) -> Tuple[Tuple[Optional[float], Optional[float]], bool]:
+        """Return cached balances, refreshing if stale or forced."""
+        now = asyncio.get_event_loop().time()
+        cache_age = now - self._last_balance_poll_time
+        need_refresh = (
+            force_refresh
+            or self._cached_balances == (None, None)
+            or cache_age >= self._balance_poll_interval_seconds
+        )
+
+        if need_refresh:
+            balances = await self._fetch_account_balances()
+            if balances != (None, None):
+                self._cached_balances = balances
+                self._last_balance_poll_time = now
+                return balances, True
+            return self._cached_balances, False
+
+        return self._cached_balances, False
+
+    async def _poll_and_enforce_balances(self, context: str, *, force_refresh: bool = False) -> bool:
+        balances, refreshed = await self._get_balances(force_refresh=force_refresh)
+
+        if refreshed or balances != (None, None):
+            suffix = "fresh" if refreshed else "cached"
+            self._log_balance_snapshot(balances, f"{context} ({suffix})")
+        else:
+            logger.warning("Balance snapshot unavailable during %s", context)
+
+        return self._balances_meet_thresholds(balances, context)
+
+    async def _sleep_with_balance_checks(self, total_seconds: int) -> None:
+        """Sleep while periodically checking account balances."""
+        remaining = float(total_seconds)
+        # Ensure we check at least every 5 seconds regardless of poll interval
+        min_interval = 5.0
+
+        while self.is_running and remaining > 0:
+            interval = min(remaining, max(min_interval, self._balance_poll_interval_seconds))
+            await asyncio.sleep(interval)
+            remaining -= interval
+
+            if not self.is_running:
+                break
+
+            await self._poll_and_enforce_balances("interval wait")
+            if not self.is_running:
+                break
 
     def _record_trade_execution(
         self,
@@ -417,7 +525,10 @@ class DeltaNeutralOrchestrator:
         logger.info("✅ Leverage updated on both accounts")
         return True
     
-    async def execute_delta_neutral_trade(self) -> Tuple[bool, str]:
+    async def execute_delta_neutral_trade(
+        self,
+        pre_trade_balances: Optional[Tuple[Optional[float], Optional[float]]] = None,
+    ) -> Tuple[bool, str]:
         """Execute simultaneous long and short market orders using isolated workers"""
         try:
             # Randomly select a market from the whitelist
@@ -572,7 +683,13 @@ class DeltaNeutralOrchestrator:
             logger.info(f"  Long leverage: {leverage_long}x | Short leverage: {leverage_short}x")
             
             # Snapshot balances before submitting orders
-            pre_trade_balances = await self._fetch_account_balances()
+            if pre_trade_balances is None:
+                pre_trade_balances, _ = await self._get_balances(force_refresh=True)
+
+            if pre_trade_balances != (None, None):
+                self._log_balance_snapshot(pre_trade_balances, f"trade #{self.trade_count} pre-submit")
+            else:
+                logger.warning("Pre-trade balance snapshot unavailable for trade #%s", self.trade_count)
 
             # Prepare account configurations
             account1_config = {
@@ -695,7 +812,7 @@ class DeltaNeutralOrchestrator:
     
     async def close_positions_task(self):
         """Background task to close positions when their time comes"""
-        while self.is_running:
+        while self.is_running or self.open_positions:
             try:
                 current_time = asyncio.get_event_loop().time()
                 positions_to_close = []
@@ -1004,16 +1121,19 @@ class DeltaNeutralOrchestrator:
     async def run_continuous(self):
         """Run continuous trading with configured interval"""
         self.is_running = True
-        
+
         # Update leverage on both accounts first
         await self.update_leverage_both_accounts()
-        
+
         # Start background task for closing positions
         close_task = asyncio.create_task(self.close_positions_task())
-        
+
+        if not await self._poll_and_enforce_balances("startup", force_refresh=True):
+            logger.error("Initial balance check failed. Halting before starting trades.")
+
         logger.info(f"Starting continuous trading with {self.config.interval_seconds}s interval")
         logger.info(f"Positions will close randomly between {self.config.min_close_delay}-{self.config.max_close_delay}s after opening")
-        
+
         try:
             while self.is_running:
                 if self.close_failure_alert_active:
@@ -1023,15 +1143,23 @@ class DeltaNeutralOrchestrator:
                     await asyncio.sleep(5)
                     continue
 
-                self.trade_count += 1
+                next_trade_number = self.trade_count + 1
+                if not await self._poll_and_enforce_balances(f"trade #{next_trade_number} pre-check", force_refresh=True):
+                    break
+
+                pre_trade_balances = self._cached_balances
+
+                self.trade_count = next_trade_number
 
                 logger.info(f"\n{'='*60}")
                 logger.info(f"Trade #{self.trade_count}")
                 logger.info(f"{'='*60}")
-                
+
                 # Execute trade
-                success, message = await self.execute_delta_neutral_trade()
-                
+                success, message = await self.execute_delta_neutral_trade(
+                    pre_trade_balances=pre_trade_balances,
+                )
+
                 if success:
                     self.success_count += 1
                 else:
@@ -1049,8 +1177,8 @@ class DeltaNeutralOrchestrator:
                 # Wait before next trade with random delay
                 open_delay = random.randint(self.config.min_open_delay, self.config.max_open_delay)
                 logger.info(f"Waiting {open_delay}s until next trade (range: {self.config.min_open_delay}-{self.config.max_open_delay}s)...")
-                await asyncio.sleep(open_delay)
-                
+                await self._sleep_with_balance_checks(open_delay)
+
         except KeyboardInterrupt:
             logger.info("\nReceived interrupt signal")
         finally:

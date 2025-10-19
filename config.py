@@ -54,6 +54,9 @@ class BotConfig:
     max_trades: int
     use_batch_mode: bool
     market_metadata_ttl_seconds: int
+    min_account1_balance: Optional[float] = None
+    min_account2_balance: Optional[float] = None
+    min_combined_balance: Optional[float] = None
 
     _market_info_cache: Dict[int, Tuple[dict, float]] = field(default_factory=dict, init=False, repr=False)
     _size_decimal_cache: Dict[int, Tuple[int, float]] = field(default_factory=dict, init=False, repr=False)
@@ -81,17 +84,33 @@ class BotConfig:
             """Parse comma-separated market IDs from string"""
             if not whitelist_str or not whitelist_str.strip():
                 return [fallback_market]
-            
+
             try:
                 markets = [int(m.strip()) for m in whitelist_str.split(',') if m.strip()]
                 return markets if markets else [fallback_market]
             except ValueError as e:
                 raise ValueError(f"Invalid MARKET_WHITELIST format: {e}")
-        
+
+        def parse_optional_float(key: str) -> Optional[float]:
+            """Parse an optional float value ensuring it is non-negative."""
+            raw_value = os.getenv(key)
+            if raw_value is None or raw_value.strip() == '':
+                return None
+
+            try:
+                value = float(raw_value)
+            except ValueError as exc:
+                raise ValueError(f"Environment variable {key} must be a number: {exc}")
+
+            if value < 0:
+                raise ValueError(f"Environment variable {key} must be non-negative")
+
+            return value
+
         market_index = int(get_optional_env('MARKET_INDEX', '0'))
         market_whitelist_str = get_optional_env('MARKET_WHITELIST', '')
         market_whitelist = parse_market_whitelist(market_whitelist_str, market_index)
-        
+
         return cls(
             base_url=get_optional_env('BASE_URL', 'https://testnet.zklighter.elliot.ai'),
             account1_private_key=ensure_0x_prefix(get_required_env('ACCOUNT1_PRIVATE_KEY')),
@@ -117,6 +136,9 @@ class BotConfig:
             max_trades=int(get_optional_env('MAX_TRADES', '0')),
             use_batch_mode=get_optional_env('USE_BATCH_MODE', 'false').lower() == 'true',
             market_metadata_ttl_seconds=int(get_optional_env('MARKET_METADATA_TTL_SECONDS', '300')),
+            min_account1_balance=parse_optional_float('MIN_ACCOUNT1_BALANCE'),
+            min_account2_balance=parse_optional_float('MIN_ACCOUNT2_BALANCE'),
+            min_combined_balance=parse_optional_float('MIN_COMBINED_BALANCE'),
         )
 
     def _current_time(self) -> float:
@@ -332,10 +354,15 @@ class BotConfig:
         
         if self.max_trades < 0:
             raise ValueError("max_trades must be non-negative")
-        
+
         if self.account1_index == self.account2_index:
             raise ValueError("account1_index and account2_index must be different")
-        
+
+        for attr in ('min_account1_balance', 'min_account2_balance', 'min_combined_balance'):
+            value = getattr(self, attr)
+            if value is not None and value < 0:
+                raise ValueError(f"{attr} must be non-negative when provided")
+
         return True
     
     async def validate_with_api(self) -> bool:

@@ -11,6 +11,9 @@ def make_config():
         account1_index=0,
         account2_index=1,
         api_client=None,
+        min_account1_balance=None,
+        min_account2_balance=None,
+        min_combined_balance=None,
     )
 
 

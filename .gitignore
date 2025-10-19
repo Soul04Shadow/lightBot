@@ -42,6 +42,7 @@ test_*.py
 !tests/test_leverage_updates.py
 !tests/test_slippage_pricing.py
 !tests/test_trade_metrics.py
+!tests/test_balance_guards.py
 
 # Personal notes
 notes.txt
