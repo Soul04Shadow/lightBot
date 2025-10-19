@@ -11,7 +11,7 @@ import logging
 import random
 import sys
 from datetime import datetime
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Sequence, Any
 from dotenv import load_dotenv
 import lighter
 from config import BotConfig
@@ -51,6 +51,32 @@ class DeltaNeutralOrchestrator:
     def select_random_market(self) -> int:
         """Randomly select a market from the whitelist"""
         return random.choice(self.config.market_whitelist)
+
+    def _validate_worker_results(self, results: Sequence[Any], context: str) -> None:
+        """Validate results returned from worker commands."""
+        errors = []
+
+        for idx, result in enumerate(results, start=1):
+            if isinstance(result, Exception):
+                logger.error(
+                    "Worker %s encountered an exception while attempting to %s: %s",
+                    idx,
+                    context,
+                    result,
+                )
+                errors.append(f"worker {idx} exception: {result}")
+            elif isinstance(result, dict) and not result.get('success', True):
+                error_detail = result.get('error') or result
+                logger.error(
+                    "Worker %s reported failure while attempting to %s: %s",
+                    idx,
+                    context,
+                    error_detail,
+                )
+                errors.append(f"worker {idx} failure: {error_detail}")
+
+        if errors:
+            raise RuntimeError(f"Failed to {context}: {'; '.join(errors)}")
     
     async def _get_market_precision(self, market_id: int, fallback_price: float) -> int:
         """
@@ -204,12 +230,14 @@ class DeltaNeutralOrchestrator:
         }
         
         # Update leverage for both accounts in parallel
-        await asyncio.gather(
+        results = await asyncio.gather(
             self.run_worker_command(account1_config, leverage_command),
             self.run_worker_command(account2_config, leverage_command),
             return_exceptions=True
         )
-        
+
+        self._validate_worker_results(results, "update leverage on both accounts")
+
         logger.info("✅ Leverage updated on both accounts")
         return True
     
@@ -268,7 +296,9 @@ class DeltaNeutralOrchestrator:
             self.run_worker_command(account2_config, leverage_command_account2),
             return_exceptions=True
         )
-        
+
+        self._validate_worker_results(results, "update leverage for accounts")
+
         logger.info("✅ Leverage updated on both accounts")
         return True
     

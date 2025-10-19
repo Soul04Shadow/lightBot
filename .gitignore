@@ -39,6 +39,7 @@ Thumbs.db
 htmlcov/
 test_*.py
 !test_market_whitelist.py
+!tests/test_leverage_updates.py
 
 # Personal notes
 notes.txt
