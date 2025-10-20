@@ -158,6 +158,50 @@ MAX_SESSION_BLEED=-100
 
 All balance thresholds must be non-negative. `MAX_SESSION_BLEED` must be zero or negative because it represents an allowed loss. When triggered the bot logs a critical alert, stops opening new trades, and lets existing positions settle.
 
+## 📲 Telegram Operations
+
+Integrate the orchestrator with Telegram for real-time monitoring and operator commands.
+
+### Environment Variables
+
+Add the following settings to your `.env` file:
+
+```env
+# Telegram bot credentials
+TELEGRAM_BOT_TOKEN=123456789:ABCDEF_your_botfather_token
+TELEGRAM_OPERATOR_CHAT_ID=123456789  # comma-separated list supported via TELEGRAM_OPERATOR_CHAT_IDS
+
+# Optional broadcast channel for automated trade logs
+TELEGRAM_BROADCAST_CHAT_ID=-1001234567890
+```
+
+> **Tip:** Use [@userinfobot](https://t.me/userinfobot) or `/setlogchannel` (see below) to discover chat IDs. Channel IDs usually begin with `-100`.
+
+### Running the Telegram service
+
+Install dependencies and launch the bot runner:
+
+```bash
+pip install -r requirements.txt
+python telegram_runner.py --auto-post  # or --no-auto-post to disable automatic trade logs
+```
+
+The runner enforces operator-only access and wires the notifier into `DeltaNeutralOrchestrator`. Auto-posting defaults to `True` when a broadcast channel is configured; override it at startup or via `/setlogchannel`.
+
+### Available commands
+
+From an authorized chat:
+
+| Command | Description |
+|---------|-------------|
+| `/status` | Current orchestrator status (running flag, trade counters, stop reason). |
+| `/balances` | Latest cached balances for both accounts (forces a refresh). |
+| `/config` | Non-sensitive configuration summary (base URL, markets, leverage settings). |
+| `/session` | Aggregate session metrics including market-level trade volumes and bleed. |
+| `/setlogchannel [chat_id] [on|off]` | View or update the broadcast channel. Passing `off` clears the channel and disables auto-posting. |
+
+Trade opens, closes, balance snapshots, and drawdown alerts are delivered to all operator chats. When auto-posting is enabled they are also mirrored to the configured broadcast channel.
+
 
 ```powershell- Sufficient balance in both accounts for trading
 
