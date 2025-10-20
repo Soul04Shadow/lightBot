@@ -45,6 +45,7 @@ test_*.py
 !tests/test_balance_guards.py
 !tests/test_account_worker.py
 !tests/test_session_bleed_guard.py
+!tests/test_telegram_bot.py
 
 # Personal notes
 notes.txt

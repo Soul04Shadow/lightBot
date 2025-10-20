@@ -12,10 +12,12 @@ import random
 import sys
 from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_UP
 from datetime import datetime
+from threading import RLock
 from typing import Optional, Tuple, Sequence, Any, Dict
 from dotenv import load_dotenv
 import lighter
 from config import BotConfig
+from telegram_bot import TelegramNotifier
 
 load_dotenv()
 
@@ -53,8 +55,9 @@ class DeltaNeutralOrchestrator:
         except (InvalidOperation, ValueError, TypeError) as exc:
             raise ValueError(f"Unable to convert price {price} to int with decimals {price_decimals}: {exc}") from exc
 
-    def __init__(self, config: BotConfig):
+    def __init__(self, config: BotConfig, telegram_notifier: Optional[TelegramNotifier] = None):
         self.config = config
+        self.notifier = telegram_notifier
         self.trade_count = 0
         self.success_count = 0
         self.is_running = False
@@ -81,10 +84,26 @@ class DeltaNeutralOrchestrator:
         self._cached_balances: Tuple[Optional[float], Optional[float]] = (None, None)
         self._last_balance_poll_time: float = 0.0
         self._balance_poll_interval_seconds: float = 30.0
+        self._state_lock = RLock()
 
     def select_random_market(self) -> int:
         """Randomly select a market from the whitelist"""
         return random.choice(self.config.market_whitelist)
+
+    def attach_notifier(self, notifier: Optional[TelegramNotifier]) -> None:
+        """Attach or replace the Telegram notifier."""
+        self.notifier = notifier
+
+    def _schedule_notification(self, coro) -> None:
+        if not self.notifier or not coro:
+            return
+
+        try:
+            asyncio.create_task(coro)
+        except RuntimeError:
+            # Event loop may not be running; fall back to synchronous execution
+            loop = asyncio.get_event_loop()
+            loop.create_task(coro)
 
     def _validate_worker_results(self, results: Sequence[Any], context: str) -> None:
         """Validate results returned from worker commands."""
@@ -191,9 +210,60 @@ class DeltaNeutralOrchestrator:
             )
             self.stop_reason = f"Balance floor breached during {context}: {breach_details}"
             self.is_running = False
+            if self.notifier:
+                self._schedule_notification(
+                    self.notifier.emit_drawdown_alert(
+                        context=context,
+                        reason=breach_details,
+                    )
+                )
             return False
 
         return True
+
+    def get_status_snapshot(self) -> Dict[str, Any]:
+        """Return a thread-safe snapshot of core orchestrator state."""
+        with self._state_lock:
+            return {
+                'is_running': self.is_running,
+                'trade_count': self.trade_count,
+                'success_count': self.success_count,
+                'open_positions': len(self.open_positions),
+                'stop_reason': self.stop_reason,
+            }
+
+    def get_config_view(self) -> Dict[str, Any]:
+        """Expose non-sensitive configuration values for operator inspection."""
+        return {
+            'base_url': self.config.base_url,
+            'market_index': self.config.market_index,
+            'market_whitelist': list(self.config.market_whitelist),
+            'leverage': self.config.leverage,
+            'use_dynamic_leverage': self.config.use_dynamic_leverage,
+        }
+
+    def get_session_snapshot(self) -> Dict[str, Any]:
+        """Return aggregate session metrics and market stats."""
+        with self._state_lock:
+            market_stats_copy = {
+                market_id: stats.copy()
+                for market_id, stats in self.market_stats.items()
+            }
+            return {
+                'total_notional': self.total_notional,
+                'total_volume_long': self.total_volume_long,
+                'total_volume_short': self.total_volume_short,
+                'realized_bleed': self.realized_bleed,
+                'market_stats': market_stats_copy,
+            }
+
+    async def get_balances_snapshot(self, *, force_refresh: bool = False) -> Tuple[
+        Tuple[Optional[float], Optional[float]],
+        bool,
+    ]:
+        """Expose cached balances and indicate whether they were refreshed."""
+
+        return await self._get_balances(force_refresh=force_refresh)
 
     async def _get_balances(
         self,
@@ -212,12 +282,15 @@ class DeltaNeutralOrchestrator:
         if need_refresh:
             balances = await self._fetch_account_balances()
             if balances != (None, None):
-                self._cached_balances = balances
-                self._last_balance_poll_time = now
+                with self._state_lock:
+                    self._cached_balances = balances
+                    self._last_balance_poll_time = now
                 return balances, True
-            return self._cached_balances, False
+            with self._state_lock:
+                return self._cached_balances, False
 
-        return self._cached_balances, False
+        with self._state_lock:
+            return self._cached_balances, False
 
     async def _poll_and_enforce_balances(self, context: str, *, force_refresh: bool = False) -> bool:
         balances, refreshed = await self._get_balances(force_refresh=force_refresh)
@@ -225,6 +298,13 @@ class DeltaNeutralOrchestrator:
         if refreshed or balances != (None, None):
             suffix = "fresh" if refreshed else "cached"
             self._log_balance_snapshot(balances, f"{context} ({suffix})")
+            if self.notifier:
+                self._schedule_notification(
+                    self.notifier.emit_balance_snapshot(
+                        context=f"{context} ({suffix})",
+                        balances=balances,
+                    )
+                )
         else:
             logger.warning("Balance snapshot unavailable during %s", context)
 
@@ -255,25 +335,32 @@ class DeltaNeutralOrchestrator:
         notional_usd: float,
     ) -> None:
         """Update aggregate trade metrics after a successful open."""
-        self.total_volume_long += base_amount_decimal
-        self.total_volume_short += base_amount_decimal
-        self.total_notional += notional_usd
+        with self._state_lock:
+            self.total_volume_long += base_amount_decimal
+            self.total_volume_short += base_amount_decimal
+            self.total_notional += notional_usd
 
-        market_stat = self.market_stats[market_index]
-        market_stat['notional'] += notional_usd
-        market_stat['volume_long'] += base_amount_decimal
-        market_stat['volume_short'] += base_amount_decimal
+            market_stat = self.market_stats[market_index]
+            market_stat['notional'] += notional_usd
+            market_stat['volume_long'] += base_amount_decimal
+            market_stat['volume_short'] += base_amount_decimal
 
     def _log_session_summary(self, prefix: str = "Session stats") -> None:
         """Emit a summary log line with cumulative session metrics."""
-        reason_suffix = f" | halt_reason={self.stop_reason}" if self.stop_reason else ""
+        with self._state_lock:
+            reason_suffix = f" | halt_reason={self.stop_reason}" if self.stop_reason else ""
+            total_notional = self.total_notional
+            total_volume_long = self.total_volume_long
+            total_volume_short = self.total_volume_short
+            realized_bleed = self.realized_bleed
+
         logger.info(
             "%s -> total_notional=$%.2f | long_volume=%.6f | short_volume=%.6f | net_bleed=$%.2f%s",
             prefix,
-            self.total_notional,
-            self.total_volume_long,
-            self.total_volume_short,
-            self.realized_bleed,
+            total_notional,
+            total_volume_long,
+            total_volume_short,
+            realized_bleed,
             reason_suffix,
         )
 
@@ -300,25 +387,47 @@ class DeltaNeutralOrchestrator:
         delta_short = post_balances[1] - pre_balances[1]
         trade_bleed = delta_long + delta_short
 
-        self.realized_bleed += trade_bleed
+        halt_reason: Optional[str] = None
+        with self._state_lock:
+            self.realized_bleed += trade_bleed
 
-        max_session_bleed = getattr(self.config, 'max_session_bleed', None)
-        if max_session_bleed is not None and self.realized_bleed <= max_session_bleed:
-            reason = (
-                f"Session bleed ${self.realized_bleed:.2f} reached floor ${max_session_bleed:.2f}"
-            )
-            if self.stop_reason != reason:
-                logger.critical(
-                    "🚨 Session bleed limit reached (%.2f <= %.2f). Halting new trades.",
-                    self.realized_bleed,
-                    max_session_bleed,
+            max_session_bleed = getattr(self.config, 'max_session_bleed', None)
+            if max_session_bleed is not None and self.realized_bleed <= max_session_bleed:
+                halt_reason = (
+                    f"Session bleed ${self.realized_bleed:.2f} reached floor ${max_session_bleed:.2f}"
                 )
-            self.stop_reason = reason
-            self.is_running = False
+                if self.stop_reason != halt_reason:
+                    logger.critical(
+                        "🚨 Session bleed limit reached (%.2f <= %.2f). Halting new trades.",
+                        self.realized_bleed,
+                        max_session_bleed,
+                    )
+                self.stop_reason = halt_reason
+                self.is_running = False
 
-        market_index = position_info.get('market_index')
-        if market_index in self.market_stats:
-            self.market_stats[market_index]['bleed'] += trade_bleed
+            market_index = position_info.get('market_index')
+            if market_index in self.market_stats:
+                self.market_stats[market_index]['bleed'] += trade_bleed
+
+        if self.notifier:
+            market_symbol = position_info.get('market_symbol', f"Market {position_info.get('market_index')}")
+            self._schedule_notification(
+                self.notifier.emit_trade_close(
+                    market=market_symbol,
+                    trade_number=position_info.get('trade_number', 0),
+                    bleed=trade_bleed,
+                    delta_long=delta_long,
+                    delta_short=delta_short,
+                )
+            )
+
+            if halt_reason:
+                self._schedule_notification(
+                    self.notifier.emit_drawdown_alert(
+                        context='session bleed',
+                        reason=halt_reason,
+                    )
+                )
 
         position_info['post_trade_balances'] = post_balances
         position_info['finalized'] = True
@@ -641,10 +750,9 @@ class DeltaNeutralOrchestrator:
                     )
                     return False, f"Failed to get valid best ask for {market_symbol}"
 
-            max_slippage = self.config.max_slippage
-            # For a true market order, we set a very wide price boundary.
-            long_execution_price = 999999999
-            short_execution_price = 1
+            max_slippage = max(self.config.max_slippage, 0)
+            long_execution_price = best_ask * (1 + max_slippage)
+            short_execution_price = best_bid * (1 - max_slippage)
             mid_price = (best_bid + best_ask) / 2
 
             price_scale = 10 ** price_decimals
@@ -823,9 +931,10 @@ class DeltaNeutralOrchestrator:
             
             # Both must succeed for delta neutral
             if long_success and short_success:
-                # Update market stats
-                self.market_stats[selected_market]['trades'] += 1
-                self.market_stats[selected_market]['successful'] += 1
+                with self._state_lock:
+                    self.market_stats[selected_market]['trades'] += 1
+                    self.market_stats[selected_market]['successful'] += 1
+
                 self._record_trade_execution(
                     selected_market,
                     base_amount_decimal,
@@ -850,7 +959,20 @@ class DeltaNeutralOrchestrator:
                     'short_closed': False,
                     'pre_trade_balances': pre_trade_balances,
                 }
-                self.open_positions.append(position_info)
+
+                with self._state_lock:
+                    self.open_positions.append(position_info)
+
+                if self.notifier:
+                    self._schedule_notification(
+                        self.notifier.emit_trade_open(
+                            market=market_symbol,
+                            trade_number=self.trade_count,
+                            notional=actual_notional_usd,
+                            base_amount=base_amount_decimal,
+                            close_delay=close_delay,
+                        )
+                    )
 
                 logger.info(f"✅ Delta neutral trade executed successfully on {market_symbol}")
                 logger.info(f"📅 Position will close in {close_delay} seconds")
@@ -858,7 +980,8 @@ class DeltaNeutralOrchestrator:
                 return True, "Success"
             else:
                 # Update market stats for failed trade
-                self.market_stats[selected_market]['trades'] += 1
+                with self._state_lock:
+                    self.market_stats[selected_market]['trades'] += 1
                 self._log_session_summary("Session stats after failed trade")
                 return False, f"One or both orders failed for {market_symbol}"
 
@@ -869,13 +992,19 @@ class DeltaNeutralOrchestrator:
     
     async def close_positions_task(self):
         """Background task to close positions when their time comes"""
-        while self.is_running or self.open_positions:
+        while True:
             try:
+                with self._state_lock:
+                    running = self.is_running
+                    open_positions_snapshot = list(self.open_positions)
+                if not running and not open_positions_snapshot:
+                    break
+
                 current_time = asyncio.get_event_loop().time()
                 positions_to_close = []
                 remaining_positions = []
 
-                for pos in self.open_positions:
+                for pos in open_positions_snapshot:
                     next_retry_time = pos.get('next_retry_time', pos.get('close_time', 0))
                     if next_retry_time is None:
                         next_retry_time = pos.get('close_time', 0)
@@ -931,25 +1060,30 @@ class DeltaNeutralOrchestrator:
                             )
 
                             if failure_count >= self.max_close_retries:
-                                if not self.close_failure_alert_active:
+                                emit_alert = False
+                                with self._state_lock:
+                                    if not self.close_failure_alert_active:
+                                        self.close_failure_alert_active = True
+                                        emit_alert = True
+                                if emit_alert:
                                     logger.error(
                                         "🚨 Trade #%s failed to close after %s attempts. Manual intervention required before"
                                         " continuing new trades.",
                                         pos['trade_number'],
                                         failure_count,
                                     )
-                                self.close_failure_alert_active = True
 
                     # Only update the list after closing is complete
-                    self.open_positions = remaining_positions + retry_positions
+                    with self._state_lock:
+                        self.open_positions = remaining_positions + retry_positions
 
-                    if self.close_failure_alert_active:
-                        if not any(
-                            p.get('close_failures', 0) >= self.max_close_retries
-                            for p in self.open_positions
-                        ):
-                            self.close_failure_alert_active = False
-                            logger.info("✅ Close failure alert cleared after successful retries.")
+                        if self.close_failure_alert_active:
+                            if not any(
+                                p.get('close_failures', 0) >= self.max_close_retries
+                                for p in self.open_positions
+                            ):
+                                self.close_failure_alert_active = False
+                                logger.info("✅ Close failure alert cleared after successful retries.")
 
                 await asyncio.sleep(1)  # Check every second
 
@@ -1044,7 +1178,7 @@ class DeltaNeutralOrchestrator:
                         'short_result': {'success': False, 'error': 'Invalid best ask'},
                     }
 
-            max_slippage = self.config.max_slippage
+            max_slippage = max(self.config.max_slippage, 0)
             close_long_execution_price = None
             close_short_execution_price = None
             close_long_execution_price_int = None
@@ -1052,10 +1186,20 @@ class DeltaNeutralOrchestrator:
             price_scale = 10 ** price_decimals
 
             if close_long:
-                close_long_execution_price_int = 1
-            
+                close_long_execution_price = best_bid * (1 - max_slippage)
+                close_long_execution_price_int = self._price_to_int(
+                    close_long_execution_price,
+                    price_decimals,
+                    ROUND_DOWN,
+                )
+
             if close_short:
-                close_short_execution_price_int = 999999999
+                close_short_execution_price = best_ask * (1 + max_slippage)
+                close_short_execution_price_int = self._price_to_int(
+                    close_short_execution_price,
+                    price_decimals,
+                    ROUND_UP,
+                )
 
             if close_long or close_short:
                 limit_messages = []

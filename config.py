@@ -63,6 +63,11 @@ class BotConfig:
     min_account2_balance: Optional[float] = None
     min_combined_balance: Optional[float] = None
 
+    # Telegram integration
+    telegram_bot_token: Optional[str] = None
+    telegram_operator_chat_ids: Tuple[int, ...] = field(default_factory=tuple)
+    telegram_broadcast_chat_id: Optional[int] = None
+
     _market_info_cache: Dict[int, Tuple[dict, float]] = field(default_factory=dict, init=False, repr=False)
     _size_decimal_cache: Dict[int, Tuple[int, float]] = field(default_factory=dict, init=False, repr=False)
     
@@ -169,9 +174,65 @@ class BotConfig:
 
             return value
 
+        def parse_chat_ids(raw_ids: str, *, env_key: str) -> Tuple[int, ...]:
+            """Parse a comma separated list of Telegram chat IDs into a tuple of ints."""
+            try:
+                parsed = {
+                    int(chat_id.strip())
+                    for chat_id in raw_ids.split(',')
+                    if chat_id.strip()
+                }
+            except ValueError as exc:
+                raise ValueError(
+                    f"Environment variable {env_key} must contain integer chat IDs: {exc}"
+                ) from exc
+
+            if not parsed:
+                raise ValueError(f"Environment variable {env_key} must include at least one chat ID")
+
+            return tuple(sorted(parsed))
+
         market_index = int(get_optional_env('MARKET_INDEX', '0'))
         market_whitelist_str = get_optional_env('MARKET_WHITELIST', '')
         market_whitelist = parse_market_whitelist(market_whitelist_str, market_index)
+
+        telegram_bot_token = os.getenv('TELEGRAM_BOT_TOKEN')
+        operator_ids_raw = (
+            os.getenv('TELEGRAM_OPERATOR_CHAT_IDS')
+            or os.getenv('TELEGRAM_OPERATOR_CHAT_ID')
+        )
+        broadcast_chat_raw = os.getenv('TELEGRAM_BROADCAST_CHAT_ID')
+
+        telegram_operator_chat_ids: Tuple[int, ...] = tuple()
+        telegram_broadcast_chat_id: Optional[int] = None
+
+        if telegram_bot_token:
+            if ':' not in telegram_bot_token:
+                raise ValueError(
+                    'TELEGRAM_BOT_TOKEN must be a valid bot token (expected ":" separator).'
+                )
+
+            if not operator_ids_raw:
+                raise ValueError(
+                    'TELEGRAM_OPERATOR_CHAT_ID(S) must be provided when TELEGRAM_BOT_TOKEN is set.'
+                )
+
+            telegram_operator_chat_ids = parse_chat_ids(
+                operator_ids_raw, env_key='TELEGRAM_OPERATOR_CHAT_ID(S)'
+            )
+
+            if broadcast_chat_raw:
+                try:
+                    telegram_broadcast_chat_id = int(broadcast_chat_raw.strip())
+                except ValueError as exc:
+                    raise ValueError(
+                        'TELEGRAM_BROADCAST_CHAT_ID must be a valid integer chat ID'
+                    ) from exc
+        else:
+            if operator_ids_raw or broadcast_chat_raw:
+                logger.warning(
+                    "Telegram chat IDs provided without TELEGRAM_BOT_TOKEN; notifier will be disabled."
+                )
 
         return cls(
             base_url=get_optional_env('BASE_URL', 'https://testnet.zklighter.elliot.ai'),
@@ -203,6 +264,9 @@ class BotConfig:
             min_account2_balance=parse_optional_float('MIN_ACCOUNT2_BALANCE'),
             min_combined_balance=parse_optional_float('MIN_COMBINED_BALANCE'),
             max_session_bleed=parse_optional_non_positive_float('MAX_SESSION_BLEED'),
+            telegram_bot_token=telegram_bot_token,
+            telegram_operator_chat_ids=telegram_operator_chat_ids,
+            telegram_broadcast_chat_id=telegram_broadcast_chat_id,
         )
 
     def _current_time(self) -> float:
