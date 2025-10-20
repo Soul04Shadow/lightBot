@@ -70,25 +70,24 @@ class TelegramNotifier:
             logger.error("Failed to deliver direct Telegram message to %s: %s", chat_id, exc)
 
     async def send_trade_log(self, message: str) -> None:
-        """Send trade log style messages to the broadcast channel or operators."""
+        """Send trade log style messages to the broadcast channel if configured."""
 
         target_chat = self.broadcast_chat_id if self.auto_post_enabled else None
 
         if target_chat is not None:
             await self.send_direct_message(target_chat, message)
-        else:
-            await self.send_operator_message(message)
 
     async def emit_trade_open(self, *, market: str, trade_number: int, notional: float,
-                              base_amount: float, close_delay: int) -> None:
+                              base_amount: float, close_delay: int, leverage_long: int, leverage_short: int) -> None:
         """Broadcast a trade open summary."""
 
         message = (
-            f"⚡️ *Trade #{trade_number} Opened*\n"
-            f"• Market: `{market}`\n"
-            f"• Base: {base_amount:.6f}\n"
-            f"• Notional: ${notional:.2f}\n"
-            f"• Close ETA: ~{close_delay}s"
+            f"🚀 *New Trade Opened: #{trade_number}*\n\n"
+            f"▪️ *Market:* `{market}`\n"
+            f"▪️ *Notional:* `${notional:,.2f}`\n"
+            f"▪️ *Size:* `{base_amount:.6f}`\n"
+            f"▪️ *Leverage (L/S):* `{leverage_long}x / {leverage_short}x`\n"
+            f"▪️ *Closing in:* `~{close_delay}s`"
         )
         await self.send_trade_log(message)
 
@@ -96,13 +95,15 @@ class TelegramNotifier:
                                delta_long: float, delta_short: float) -> None:
         """Broadcast a trade close summary with realized bleed."""
 
-        emoji = "✅" if bleed >= 0 else "⚠️"
+        emoji = "✅" if bleed >= 0 else "🔻"
+        pnl_str = f"+${bleed:.2f}" if bleed >= 0 else f"-${abs(bleed):.2f}"
+
         message = (
-            f"{emoji} *Trade #{trade_number} Closed*\n"
-            f"• Market: `{market}`\n"
-            f"• Bleed: ${bleed:.2f}\n"
-            f"• ΔLong: ${delta_long:.2f}\n"
-            f"• ΔShort: ${delta_short:.2f}"
+            f"{emoji} *Trade #{trade_number} Closed*\n\n"
+            f"▪️ *Market:* `{market}`\n"
+            f"▪️ *Realized PnL:* `{pnl_str}`\n"
+            f"▪️ *Account 1 (Long) Δ:* `{delta_long:+.2f}`\n"
+            f"▪️ *Account 2 (Short) Δ:* `{delta_short:+.2f}`"
         )
         await self.send_trade_log(message)
 
@@ -155,10 +156,65 @@ class TelegramBotController:
         """Register command handlers on the supplied application."""
 
         application.add_handler(CommandHandler('status', self._handle_status))
+        application.add_handler(CommandHandler('pause', self._handle_pause))
+        application.add_handler(CommandHandler('resume', self._handle_resume))
+        application.add_handler(CommandHandler('pnl', self._handle_pnl))
         application.add_handler(CommandHandler('balances', self._handle_balances))
         application.add_handler(CommandHandler('config', self._handle_config))
         application.add_handler(CommandHandler('session', self._handle_session))
         application.add_handler(CommandHandler('setlogchannel', self._handle_setlogchannel))
+
+    async def _handle_pause(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handler for the /pause command."""
+        if not await self._ensure_authorized(update):
+            return
+        
+        response = self.orchestrator.pause()
+        await update.message.reply_text(response)
+
+    async def _handle_resume(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handler for the /resume command."""
+        if not await self._ensure_authorized(update):
+            return
+        
+        response = self.orchestrator.resume()
+        await update.message.reply_text(response)
+        
+        # If resume is successful, restart the trading loop
+        if "Restarting" in response:
+            asyncio.create_task(self.orchestrator.run_continuous())
+
+    async def _handle_pnl(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handler for the /pnl command."""
+        if not await self._ensure_authorized(update):
+            return
+
+        pnl_data = await self.orchestrator.get_pnl_snapshot()
+        if 'error' in pnl_data:
+            await update.message.reply_text(pnl_data['error'])
+            return
+
+        def format_pnl(pnl):
+            return f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
+
+        message = (
+            "📈 *Session PnL Snapshot*\n\n"
+            "*Account 1 (Long):*\n"
+            f"  - Start: `{self.notifier._format_currency(pnl_data['initial_balance_acc1'])}`\n"
+            f"  - Current: `{self.notifier._format_currency(pnl_data['current_balance_acc1'])}`\n"
+            f"  - PnL: `{format_pnl(pnl_data['pnl_acc1'])}`\n\n"
+            "*Account 2 (Short):*\n"
+            f"  - Start: `{self.notifier._format_currency(pnl_data['initial_balance_acc2'])}`\n"
+            f"  - Current: `{self.notifier._format_currency(pnl_data['current_balance_acc2'])}`\n"
+            f"  - PnL: `{format_pnl(pnl_data['pnl_acc2'])}`\n\n"
+            f"👉 *Total PnL: `{format_pnl(pnl_data['total_pnl'])}`*"
+        )
+
+        await update.message.reply_text(
+            message,
+            parse_mode=ParseMode.MARKDOWN,
+            disable_web_page_preview=True,
+        )
 
     async def _handle_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         if not await self._ensure_authorized(update):
@@ -286,4 +342,3 @@ class TelegramBotController:
 
 
 __all__ = ['TelegramNotifier', 'TelegramBotController', 'AuthorizationError']
-
