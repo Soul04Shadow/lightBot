@@ -26,4 +26,4 @@ python-dotenv>=1.0.0
 colorlog>=6.7.0
 
 # Telegram bot integration
-python-telegram-bot>=20,<21
+python-telegram-bot
