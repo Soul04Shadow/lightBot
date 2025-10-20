@@ -61,6 +61,7 @@ class DeltaNeutralOrchestrator:
         self.trade_count = 0
         self.success_count = 0
         self.is_running = False
+        self.pause_requested = False
         self.stop_reason: Optional[str] = None
         self.open_positions = []
         self.close_retry_backoff_seconds = 5
@@ -82,6 +83,7 @@ class DeltaNeutralOrchestrator:
         self.total_volume_short = 0.0
         self.realized_bleed = 0.0
         self._cached_balances: Tuple[Optional[float], Optional[float]] = (None, None)
+        self._initial_balances: Tuple[Optional[float], Optional[float]] = (None, None)
         self._last_balance_poll_time: float = 0.0
         self._balance_poll_interval_seconds: float = 30.0
         self._state_lock = RLock()
@@ -292,13 +294,14 @@ class DeltaNeutralOrchestrator:
         with self._state_lock:
             return self._cached_balances, False
 
-    async def _poll_and_enforce_balances(self, context: str, *, force_refresh: bool = False) -> bool:
+    async def _poll_and_enforce_balances(self, context: str, *, force_refresh: bool = False, notify: bool = True, log: bool = True) -> bool:
         balances, refreshed = await self._get_balances(force_refresh=force_refresh)
 
         if refreshed or balances != (None, None):
             suffix = "fresh" if refreshed else "cached"
-            self._log_balance_snapshot(balances, f"{context} ({suffix})")
-            if self.notifier:
+            if log:
+                self._log_balance_snapshot(balances, f"{context} ({suffix})")
+            if self.notifier and notify:
                 self._schedule_notification(
                     self.notifier.emit_balance_snapshot(
                         context=f"{context} ({suffix})",
@@ -309,6 +312,73 @@ class DeltaNeutralOrchestrator:
             logger.warning("Balance snapshot unavailable during %s", context)
 
         return self._balances_meet_thresholds(balances, context)
+
+    async def _log_pnl_summary(self):
+        """Logs a summary of the session PnL."""
+        pnl_data = await self.get_pnl_snapshot()
+        if 'error' in pnl_data:
+            logger.warning("Could not generate PnL summary: %s", pnl_data['error'])
+            return
+
+        def format_pnl(pnl):
+            return f"+${pnl:.2f}" if pnl >= 0 else f"-${abs(pnl):.2f}"
+
+        logger.info(
+            "Session PnL -> Acc1: %s | Acc2: %s | Total: %s",
+            format_pnl(pnl_data['pnl_acc1']),
+            format_pnl(pnl_data['pnl_acc2']),
+            format_pnl(pnl_data['total_pnl']),
+        )
+
+    async def get_pnl_snapshot(self) -> Dict[str, Any]:
+        """Return a snapshot of the session's profit and loss."""
+        with self._state_lock:
+            initial_balances = self._initial_balances
+
+        if initial_balances[0] is None or initial_balances[1] is None:
+            return {'error': 'Initial balances not yet captured.'}
+
+        latest_balances, _ = await self._get_balances(force_refresh=True)
+        if latest_balances[0] is None or latest_balances[1] is None:
+            return {'error': 'Current balances are not available to calculate PnL.'}
+
+        pnl_acc1 = latest_balances[0] - initial_balances[0]
+        pnl_acc2 = latest_balances[1] - initial_balances[1]
+        total_pnl = pnl_acc1 + pnl_acc2
+
+        return {
+            'initial_balance_acc1': initial_balances[0],
+            'current_balance_acc1': latest_balances[0],
+            'pnl_acc1': pnl_acc1,
+            'initial_balance_acc2': initial_balances[1],
+            'current_balance_acc2': latest_balances[1],
+            'pnl_acc2': pnl_acc2,
+            'total_pnl': total_pnl,
+        }
+
+    def pause(self):
+        """Requests a graceful pause of the trading bot."""
+        if not self.is_running:
+            return "Bot is not running."
+        if self.pause_requested:
+            return "Pause already in progress."
+        
+        self.pause_requested = True
+        self.stop_reason = "Paused by operator"
+        logger.info("⏸️ Pause requested. New trades will be halted. The bot will pause after closing open positions.")
+        return "Pause requested. The bot will stop opening new trades and will pause after current positions are closed."
+
+    def resume(self):
+        """Resumes trading if paused."""
+        if not self.is_running:
+            return "Bot is not running, cannot resume."
+        if not self.pause_requested:
+            return "Bot is not paused."
+
+        self.pause_requested = False
+        self.stop_reason = None
+        logger.info("▶️ Resume requested. Trading will now continue.")
+        return "Resume requested. Trading will now continue."
 
     async def _sleep_with_balance_checks(self, total_seconds: int) -> None:
         """Sleep while periodically checking account balances."""
@@ -324,7 +394,7 @@ class DeltaNeutralOrchestrator:
             if not self.is_running:
                 break
 
-            await self._poll_and_enforce_balances("interval wait")
+            await self._poll_and_enforce_balances("interval wait", notify=False, log=False)
             if not self.is_running:
                 break
 
@@ -440,6 +510,7 @@ class DeltaNeutralOrchestrator:
             delta_short,
         )
         self._log_session_summary("Session stats after close")
+        asyncio.create_task(self._log_pnl_summary())
 
     async def _get_market_precision(self, market_id: int, fallback_price: float) -> int:
         """
@@ -842,11 +913,13 @@ class DeltaNeutralOrchestrator:
                 base_amount_decimal = base_amount / display_multiplier
                 actual_notional_usd = base_amount_decimal * mid_price
             
-            logger.info(f"Executing delta neutral trade on {market_symbol}:")
-            logger.info(f"  Base amount: {base_amount / display_multiplier:.{display_precision}f} {market_symbol.split('-')[0]}")
-            logger.info(f"  Best Bid: ${best_bid:.2f}, Best Ask: ${best_ask:.2f}")
-            logger.info(f"  Spread: ${spread:.2f} ({spread_percentage:.3f}%)")
-            logger.info(f"  Long leverage: {leverage_long}x | Short leverage: {leverage_short}x")
+            log_message = (
+                f"Executing trade on {market_symbol}: "
+                f"size={base_amount / display_multiplier:.{display_precision}f}, "
+                f"spread={spread_percentage:.3f}%, "
+                f"leverage={leverage_long}x/{leverage_short}x"
+            )
+            logger.info(log_message)
             
             # Snapshot balances before submitting orders
             if pre_trade_balances is None:
@@ -971,6 +1044,8 @@ class DeltaNeutralOrchestrator:
                             notional=actual_notional_usd,
                             base_amount=base_amount_decimal,
                             close_delay=close_delay,
+                            leverage_long=leverage_long,
+                            leverage_short=leverage_short,
                         )
                     )
 
@@ -1308,8 +1383,13 @@ class DeltaNeutralOrchestrator:
     
     async def run_continuous(self):
         """Run continuous trading with configured interval"""
+        if self.is_running:
+            logger.warning("run_continuous called while already running.")
+            return
+
         self.is_running = True
-        self.stop_reason = None
+        if not self.pause_requested:
+            self.stop_reason = None
 
         # Update leverage on both accounts first
         await self.update_leverage_both_accounts()
@@ -1319,12 +1399,37 @@ class DeltaNeutralOrchestrator:
 
         if not await self._poll_and_enforce_balances("startup", force_refresh=True):
             logger.error("Initial balance check failed. Halting before starting trades.")
+        
+        # Capture initial balances if not already set
+        with self._state_lock:
+            if self._initial_balances[0] is None and self._initial_balances[1] is None:
+                self._initial_balances = self._cached_balances
+                logger.info(
+                    "Captured initial balances -> Account 1: %s | Account 2: %s",
+                    self._format_balance(self._initial_balances[0]),
+                    self._format_balance(self._initial_balances[1]),
+                )
 
         logger.info(f"Starting continuous trading with {self.config.interval_seconds}s interval")
         logger.info(f"Positions will close randomly between {self.config.min_close_delay}-{self.config.max_close_delay}s after opening")
 
         try:
             while self.is_running:
+                if self.pause_requested:
+                    with self._state_lock:
+                        open_positions_count = len(self.open_positions)
+                    
+                    if open_positions_count == 0:
+                        logger.info("All positions closed. Bot is now paused.")
+                        while self.pause_requested:
+                            await asyncio.sleep(1)
+                        logger.info("Resuming trading...")
+                        continue
+                    else:
+                        logger.info(f"Pause requested, waiting for {open_positions_count} position(s) to close...")
+                        await asyncio.sleep(5)
+                        continue
+
                 if self.close_failure_alert_active:
                     logger.error(
                         "⏸️  Close position retries exceeded threshold. Pausing new trades until manual intervention."
@@ -1471,9 +1576,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("\nBot connections closed")
-        print("\nExiting...")
-        sys.exit(0)
+    pass
