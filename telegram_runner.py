@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+import asyncio
 
 from telegram.ext import ApplicationBuilder
 
@@ -31,8 +32,10 @@ def build_argument_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main(argv: list[str] | None = None) -> int:
+async def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("telegram").setLevel(logging.WARNING)
 
     args = build_argument_parser().parse_args(argv)
 
@@ -75,10 +78,21 @@ def main(argv: list[str] | None = None) -> int:
         notifier.auto_post_enabled,
     )
 
-    application.run_polling()
+    async with application:
+        await application.initialize()
+        await application.start()
+        await application.updater.start_polling()
+
+        await orchestrator.run_continuous()
+
+        await application.updater.stop()
+        await application.stop()
+
     return 0
 
 
 if __name__ == '__main__':
-    sys.exit(main())
-
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        sys.exit(0)
