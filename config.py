@@ -55,6 +55,9 @@ class BotConfig:
     max_trades: int
     use_batch_mode: bool
     market_metadata_ttl_seconds: int
+
+    # Safeguards
+    max_session_bleed: Optional[float] = None
     min_account1_balance: Optional[float] = None
     min_account2_balance: Optional[float] = None
     min_combined_balance: Optional[float] = None
@@ -124,6 +127,22 @@ class BotConfig:
 
             return value
 
+        def parse_optional_non_positive_float(key: str) -> Optional[float]:
+            """Parse an optional float that must be zero or negative."""
+            raw_value = os.getenv(key)
+            if raw_value is None or raw_value.strip() == '':
+                return None
+
+            try:
+                value = float(raw_value)
+            except ValueError as exc:
+                raise ValueError(f"Environment variable {key} must be a number: {exc}")
+
+            if value > 0:
+                raise ValueError(f"Environment variable {key} must be less than or equal to 0")
+
+            return value
+
         market_index = int(get_optional_env('MARKET_INDEX', '0'))
         market_whitelist_str = get_optional_env('MARKET_WHITELIST', '')
         market_whitelist = parse_market_whitelist(market_whitelist_str, market_index)
@@ -157,6 +176,7 @@ class BotConfig:
             min_account1_balance=parse_optional_float('MIN_ACCOUNT1_BALANCE'),
             min_account2_balance=parse_optional_float('MIN_ACCOUNT2_BALANCE'),
             min_combined_balance=parse_optional_float('MIN_COMBINED_BALANCE'),
+            max_session_bleed=parse_optional_non_positive_float('MAX_SESSION_BLEED'),
         )
 
     def _current_time(self) -> float:
@@ -385,6 +405,9 @@ class BotConfig:
             value = getattr(self, attr)
             if value is not None and value < 0:
                 raise ValueError(f"{attr} must be non-negative when provided")
+
+        if self.max_session_bleed is not None and self.max_session_bleed > 0:
+            raise ValueError("max_session_bleed must be less than or equal to 0 when provided")
 
         return True
     

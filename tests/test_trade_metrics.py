@@ -14,6 +14,7 @@ def make_config():
         min_account1_balance=None,
         min_account2_balance=None,
         min_combined_balance=None,
+        max_session_bleed=None,
     )
 
 

@@ -151,9 +151,12 @@ MIN_ACCOUNT2_BALANCE=
 
 # Or enforce a combined floor across both accounts
 MIN_COMBINED_BALANCE=600
+
+# Stop the session if realized bleed exceeds a negative loss cap (<= 0)
+MAX_SESSION_BLEED=-100
 ```
 
-All thresholds must be non-negative. When triggered the bot logs a critical alert, stops opening new trades, and lets existing positions settle.
+All balance thresholds must be non-negative. `MAX_SESSION_BLEED` must be zero or negative because it represents an allowed loss. When triggered the bot logs a critical alert, stops opening new trades, and lets existing positions settle.
 
 
 ```powershell- Sufficient balance in both accounts for trading
