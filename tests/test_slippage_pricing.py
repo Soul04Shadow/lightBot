@@ -1,4 +1,5 @@
 import asyncio
+from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from unittest.mock import AsyncMock
 
 import pytest
@@ -43,6 +44,7 @@ def test_execute_trade_uses_slippage_limits():
     orchestrator.config.get_market_info = AsyncMock(return_value={
         "symbol": "BTC-USDT",
         "max_leverage": 20,
+        "price_decimals": 4,
     })
     orchestrator.get_current_price = AsyncMock(return_value=(100.0, 100.05))
     orchestrator.run_worker_command = AsyncMock(
@@ -56,8 +58,13 @@ def test_execute_trade_uses_slippage_limits():
     long_command = orchestrator.run_worker_command.await_args_list[0].args[1]
     short_command = orchestrator.run_worker_command.await_args_list[1].args[1]
 
-    assert long_command["order"]["execution_price"] == pytest.approx(100.05 * 1.01)
-    assert short_command["order"]["execution_price"] == pytest.approx(100.0 * 0.99)
+    expected_long_price = 100.05 * 1.01
+    expected_short_price = 100.0 * 0.99
+    expected_long_ticks = int(Decimal(str(expected_long_price)).scaleb(4).to_integral_value(rounding=ROUND_UP))
+    expected_short_ticks = int(Decimal(str(expected_short_price)).scaleb(4).to_integral_value(rounding=ROUND_DOWN))
+
+    assert long_command["order"]["execution_price"] == expected_long_ticks
+    assert short_command["order"]["execution_price"] == expected_short_ticks
 
 
 def test_execute_trade_falls_back_when_missing_bid():
@@ -66,6 +73,7 @@ def test_execute_trade_falls_back_when_missing_bid():
     orchestrator.config.get_market_info = AsyncMock(return_value={
         "symbol": "BTC-USDT",
         "max_leverage": 20,
+        "price_decimals": 4,
     })
     orchestrator.get_current_price = AsyncMock(return_value=(None, 50.0))
     orchestrator.run_worker_command = AsyncMock(
@@ -77,7 +85,9 @@ def test_execute_trade_falls_back_when_missing_bid():
 
     assert success is True
     short_command = orchestrator.run_worker_command.await_args_list[1].args[1]
-    assert short_command["order"]["execution_price"] == pytest.approx(50.0 * 0.99)
+    expected_short_price = 50.0 * 0.99
+    expected_short_ticks = int(Decimal(str(expected_short_price)).scaleb(4).to_integral_value(rounding=ROUND_DOWN))
+    assert short_command["order"]["execution_price"] == expected_short_ticks
 
 
 def test_execute_trade_blocks_on_wide_spread():
@@ -88,6 +98,7 @@ def test_execute_trade_blocks_on_wide_spread():
     orchestrator.config.get_market_info = AsyncMock(return_value={
         "symbol": "BTC-USDT",
         "max_leverage": 20,
+        "price_decimals": 4,
     })
     orchestrator.get_current_price = AsyncMock(return_value=(100.0, 100.2))
     orchestrator.run_worker_command = AsyncMock()
@@ -108,6 +119,7 @@ def test_execute_trade_respects_custom_spread_threshold():
     orchestrator.config.get_market_info = AsyncMock(return_value={
         "symbol": "BTC-USDT",
         "max_leverage": 20,
+        "price_decimals": 4,
     })
     orchestrator.get_current_price = AsyncMock(return_value=(100.0, 100.2))
     orchestrator.run_worker_command = AsyncMock(
@@ -127,6 +139,7 @@ def test_execute_trade_aborts_on_zero_prices():
     orchestrator.config.get_market_info = AsyncMock(return_value={
         "symbol": "BTC-USDT",
         "max_leverage": 20,
+        "price_decimals": 4,
     })
     orchestrator.get_current_price = AsyncMock(return_value=(0.0, 0.0))
     orchestrator.run_worker_command = AsyncMock()
@@ -139,8 +152,36 @@ def test_execute_trade_aborts_on_zero_prices():
     orchestrator.run_worker_command.assert_not_awaited()
 
 
+def test_execute_trade_passes_integer_prices_to_worker():
+    orchestrator = DeltaNeutralOrchestrator(make_config())
+    orchestrator.select_random_market = lambda: 1
+    orchestrator.config.get_market_info = AsyncMock(return_value={
+        "symbol": "BTC-USDT",
+        "max_leverage": 20,
+        "price_decimals": 3,
+    })
+    orchestrator.get_current_price = AsyncMock(return_value=(100.0, 100.05))
+    orchestrator.run_worker_command = AsyncMock(
+        side_effect=[{"success": True}, {"success": True}]
+    )
+    orchestrator._get_balances = AsyncMock(return_value=((1000.0, 1000.0), True))
+
+    success, _ = asyncio.run(orchestrator.execute_delta_neutral_trade())
+
+    assert success is True
+    for call in orchestrator.run_worker_command.await_args_list:
+        command = call.args[1]
+        execution_price = command["order"]["execution_price"]
+        assert isinstance(execution_price, int)
+
+
 def test_close_position_pair_uses_slippage_limits():
     orchestrator = DeltaNeutralOrchestrator(make_config())
+    orchestrator.config.get_market_info = AsyncMock(return_value={
+        "symbol": "BTC-USDT",
+        "max_leverage": 20,
+        "price_decimals": 4,
+    })
     orchestrator.get_current_price = AsyncMock(return_value=(100.0, 102.0))
     orchestrator.run_worker_command = AsyncMock(return_value={"success": True})
 
@@ -160,5 +201,10 @@ def test_close_position_pair_uses_slippage_limits():
     long_command = orchestrator.run_worker_command.await_args_list[0].args[1]
     short_command = orchestrator.run_worker_command.await_args_list[1].args[1]
 
-    assert long_command["order"]["execution_price"] == pytest.approx(100.0 * 0.99)
-    assert short_command["order"]["execution_price"] == pytest.approx(102.0 * 1.01)
+    expected_long_price = 100.0 * 0.99
+    expected_short_price = 102.0 * 1.01
+    expected_long_ticks = int(Decimal(str(expected_long_price)).scaleb(4).to_integral_value(rounding=ROUND_DOWN))
+    expected_short_ticks = int(Decimal(str(expected_short_price)).scaleb(4).to_integral_value(rounding=ROUND_UP))
+
+    assert long_command["order"]["execution_price"] == expected_long_ticks
+    assert short_command["order"]["execution_price"] == expected_short_ticks

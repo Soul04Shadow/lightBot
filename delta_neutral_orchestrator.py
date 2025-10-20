@@ -10,6 +10,7 @@ import json
 import logging
 import random
 import sys
+from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_UP
 from datetime import datetime
 from typing import Optional, Tuple, Sequence, Any, Dict
 from dotenv import load_dotenv
@@ -30,13 +31,28 @@ logger = logging.getLogger(__name__)
 
 
 class DeltaNeutralOrchestrator:
+    DEFAULT_PRICE_DECIMALS = 6
+
     """
     Orchestrates delta-neutral trading across two isolated account workers.
-    
+
     Manages simultaneous long/short positions, position lifecycle, and
     ensures proper isolation between accounts to prevent signer conflicts.
     """
-    
+
+    @staticmethod
+    def _price_to_int(price: float, price_decimals: int, rounding) -> int:
+        """Convert a floating price into an integer tick value using the given rounding."""
+        if price_decimals is None:
+            price_decimals = DeltaNeutralOrchestrator.DEFAULT_PRICE_DECIMALS
+
+        try:
+            decimal_price = Decimal(str(price))
+            scaled = decimal_price.scaleb(price_decimals)
+            return int(scaled.to_integral_value(rounding=rounding))
+        except (InvalidOperation, ValueError, TypeError) as exc:
+            raise ValueError(f"Unable to convert price {price} to int with decimals {price_decimals}: {exc}") from exc
+
     def __init__(self, config: BotConfig):
         self.config = config
         self.trade_count = 0
@@ -539,7 +555,8 @@ class DeltaNeutralOrchestrator:
                 market_info = await self.config.get_market_info(selected_market)
                 market_symbol = market_info['symbol']
                 market_max_leverage = market_info['max_leverage']
-                
+                price_decimals = market_info.get('price_decimals') or self.DEFAULT_PRICE_DECIMALS
+
                 # Calculate leverage for this trade
                 if self.config.use_dynamic_leverage:
                     # Select different leverage for each account
@@ -557,6 +574,7 @@ class DeltaNeutralOrchestrator:
                 market_symbol = f"Market {selected_market}"
                 leverage_long = self.config.leverage
                 leverage_short = self.config.leverage
+                price_decimals = self.DEFAULT_PRICE_DECIMALS
                 logger.info(f"📊 Selected market: {market_symbol} (ID: {selected_market})")
             
             # Update leverage for each account independently (if dynamic mode)
@@ -608,6 +626,26 @@ class DeltaNeutralOrchestrator:
             long_execution_price = best_ask * (1 + max_slippage)
             short_execution_price = best_bid * (1 - max_slippage)
             mid_price = (best_bid + best_ask) / 2
+
+            price_scale = 10 ** price_decimals
+
+            try:
+                long_execution_price_int = self._price_to_int(
+                    long_execution_price,
+                    price_decimals,
+                    ROUND_UP,
+                )
+                short_execution_price_int = self._price_to_int(
+                    short_execution_price,
+                    price_decimals,
+                    ROUND_DOWN,
+                )
+            except ValueError as exc:
+                logger.warning("Failed to convert execution prices to ticks for %s: %s", market_symbol, exc)
+                return False, f"Failed to encode execution prices for {market_symbol}"
+
+            human_long_execution_price = long_execution_price_int / price_scale
+            human_short_execution_price = short_execution_price_int / price_scale
 
             if long_execution_price <= 0 or short_execution_price <= 0:
                 logger.warning(
@@ -719,7 +757,7 @@ class DeltaNeutralOrchestrator:
                     'base_amount': base_amount,
                     'is_ask': False,  # Buy = Long
                     'client_order_index': timestamp_ms % 1000000,
-                    'execution_price': long_execution_price
+                    'execution_price': long_execution_price_int
                 }
             }
 
@@ -730,14 +768,16 @@ class DeltaNeutralOrchestrator:
                     'base_amount': base_amount,
                     'is_ask': True,  # Sell = Short
                     'client_order_index': (timestamp_ms + 1) % 1000000,
-                    'execution_price': short_execution_price
+                    'execution_price': short_execution_price_int
                 }
             }
 
             logger.info(
-                "  Execution limits -> Long buy ≤ $%.6f | Short sell ≥ $%.6f (max slippage %.2f%%)",
-                long_execution_price,
-                short_execution_price,
+                "  Execution limits -> Long buy ≤ $%.6f (ticks: %s) | Short sell ≥ $%.6f (ticks: %s) (max slippage %.2f%%)",
+                human_long_execution_price,
+                long_execution_price_int,
+                human_short_execution_price,
+                short_execution_price_int,
                 max_slippage * 100,
             )
             
@@ -916,9 +956,18 @@ class DeltaNeutralOrchestrator:
         long_close_result: Any = {'success': False}
         short_close_result: Any = {'success': False}
 
+        price_decimals = self.DEFAULT_PRICE_DECIMALS
         try:
+            market_info = await self.config.get_market_info(market_index)
+            if market_symbol is None:
+                market_symbol = market_info.get('symbol') or f"Market {market_index}"
+            price_decimals = market_info.get('price_decimals') or self.DEFAULT_PRICE_DECIMALS
+        except Exception as exc:
             if market_symbol is None:
                 market_symbol = f"Market {market_index}"
+            logger.warning("Could not fetch market info for market %s while closing positions: %s", market_index, exc)
+
+        try:
             # Prepare account configurations
             account1_config = {
                 'base_url': self.config.base_url,
@@ -981,6 +1030,9 @@ class DeltaNeutralOrchestrator:
             max_slippage = self.config.max_slippage
             close_long_execution_price = None
             close_short_execution_price = None
+            close_long_execution_price_int = None
+            close_short_execution_price_int = None
+            price_scale = 10 ** price_decimals
 
             if close_long:
                 close_long_execution_price = best_bid * (1 - max_slippage)
@@ -995,6 +1047,24 @@ class DeltaNeutralOrchestrator:
                         'short_success': False,
                         'long_result': {'success': False, 'error': 'Invalid long close price'},
                         'short_result': {'success': False, 'error': 'Invalid long close price'},
+                    }
+                try:
+                    close_long_execution_price_int = self._price_to_int(
+                        close_long_execution_price,
+                        price_decimals,
+                        ROUND_DOWN,
+                    )
+                except ValueError as exc:
+                    logger.warning(
+                        "Failed to convert long close price to ticks for %s: %s",
+                        market_symbol,
+                        exc,
+                    )
+                    return {
+                        'long_success': False,
+                        'short_success': False,
+                        'long_result': {'success': False, 'error': 'Failed to encode long close price'},
+                        'short_result': {'success': False, 'error': 'Failed to encode long close price'},
                     }
 
             if close_short:
@@ -1011,16 +1081,36 @@ class DeltaNeutralOrchestrator:
                         'long_result': {'success': False, 'error': 'Invalid short close price'},
                         'short_result': {'success': False, 'error': 'Invalid short close price'},
                     }
+                try:
+                    close_short_execution_price_int = self._price_to_int(
+                        close_short_execution_price,
+                        price_decimals,
+                        ROUND_UP,
+                    )
+                except ValueError as exc:
+                    logger.warning(
+                        "Failed to convert short close price to ticks for %s: %s",
+                        market_symbol,
+                        exc,
+                    )
+                    return {
+                        'long_success': False,
+                        'short_success': False,
+                        'long_result': {'success': False, 'error': 'Failed to encode short close price'},
+                        'short_result': {'success': False, 'error': 'Failed to encode short close price'},
+                    }
 
             if close_long or close_short:
                 limit_messages = []
                 if close_long:
+                    human_close_long_price = close_long_execution_price_int / price_scale
                     limit_messages.append(
-                        f"Long sell ≥ ${close_long_execution_price:.6f}"
+                        f"Long sell ≥ ${human_close_long_price:.6f} (ticks: {close_long_execution_price_int})"
                     )
                 if close_short:
+                    human_close_short_price = close_short_execution_price_int / price_scale
                     limit_messages.append(
-                        f"Short buy ≤ ${close_short_execution_price:.6f}"
+                        f"Short buy ≤ ${human_close_short_price:.6f} (ticks: {close_short_execution_price_int})"
                     )
                 logger.info(
                     "  Close limits -> %s (max slippage %.2f%%)",
@@ -1037,7 +1127,7 @@ class DeltaNeutralOrchestrator:
                     'is_ask': True,  # Sell to close long
                     'client_order_index': int(datetime.now().timestamp() * 1000 + 2) % 1000000,
                     'reduce_only': True,
-                    'execution_price': close_long_execution_price if close_long_execution_price is not None else 0
+                    'execution_price': close_long_execution_price_int if close_long_execution_price_int is not None else 0
                 }
             }
 
@@ -1049,7 +1139,7 @@ class DeltaNeutralOrchestrator:
                     'is_ask': False, # Buy to close short
                     'client_order_index': int(datetime.now().timestamp() * 1000 + 3) % 1000000,
                     'reduce_only': True,
-                    'execution_price': close_short_execution_price if close_short_execution_price is not None else 0
+                    'execution_price': close_short_execution_price_int if close_short_execution_price_int is not None else 0
                 }
             }
 

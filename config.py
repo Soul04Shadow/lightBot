@@ -276,10 +276,15 @@ class BotConfig:
                     if detail.market_id == market_id:
                         min_margin_fraction = detail.min_initial_margin_fraction / 10000.0
                         max_leverage = int(1.0 / min_margin_fraction)
+                        price_decimals = getattr(detail, 'price_decimals', None)
+                        if price_decimals is None:
+                            price_decimals = getattr(detail, 'supported_price_decimals', None)
+
                         info = {
                             'market_id': market_id,
                             'symbol': detail.symbol,
-                            'max_leverage': max_leverage
+                            'max_leverage': max_leverage,
+                            'price_decimals': price_decimals,
                         }
                         self.cache_market_info(market_id, info)
                         logger.info("Cached market info for market %s", market_id)
