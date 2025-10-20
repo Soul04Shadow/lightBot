@@ -642,8 +642,9 @@ class DeltaNeutralOrchestrator:
                     return False, f"Failed to get valid best ask for {market_symbol}"
 
             max_slippage = self.config.max_slippage
-            long_execution_price = best_ask * (1 + max_slippage)
-            short_execution_price = best_bid * (1 - max_slippage)
+            # For a true market order, we set a very wide price boundary.
+            long_execution_price = 999999999
+            short_execution_price = 1
             mid_price = (best_bid + best_ask) / 2
 
             price_scale = 10 ** price_decimals
@@ -792,12 +793,9 @@ class DeltaNeutralOrchestrator:
             }
 
             logger.info(
-                "  Execution limits -> Long buy ≤ $%.6f (ticks: %s) | Short sell ≥ $%.6f (ticks: %s) (max slippage %.2f%%)",
-                human_long_execution_price,
+                "  Execution limits -> Long buy ≤ $%d | Short sell ≥ $%d",
                 long_execution_price_int,
-                human_short_execution_price,
                 short_execution_price_int,
-                max_slippage * 100,
             )
             
             # Execute both orders in parallel using isolated workers
@@ -1054,87 +1052,24 @@ class DeltaNeutralOrchestrator:
             price_scale = 10 ** price_decimals
 
             if close_long:
-                close_long_execution_price = best_bid * (1 - max_slippage)
-                if close_long_execution_price <= 0:
-                    logger.warning(
-                        "Computed close price invalid for long leg on %s (price: %s)",
-                        market_symbol,
-                        close_long_execution_price,
-                    )
-                    return {
-                        'long_success': False,
-                        'short_success': False,
-                        'long_result': {'success': False, 'error': 'Invalid long close price'},
-                        'short_result': {'success': False, 'error': 'Invalid long close price'},
-                    }
-                try:
-                    close_long_execution_price_int = self._price_to_int(
-                        close_long_execution_price,
-                        price_decimals,
-                        ROUND_DOWN,
-                    )
-                except ValueError as exc:
-                    logger.warning(
-                        "Failed to convert long close price to ticks for %s: %s",
-                        market_symbol,
-                        exc,
-                    )
-                    return {
-                        'long_success': False,
-                        'short_success': False,
-                        'long_result': {'success': False, 'error': 'Failed to encode long close price'},
-                        'short_result': {'success': False, 'error': 'Failed to encode long close price'},
-                    }
-
+                close_long_execution_price_int = 1
+            
             if close_short:
-                close_short_execution_price = best_ask * (1 + max_slippage)
-                if close_short_execution_price <= 0:
-                    logger.warning(
-                        "Computed close price invalid for short leg on %s (price: %s)",
-                        market_symbol,
-                        close_short_execution_price,
-                    )
-                    return {
-                        'long_success': False,
-                        'short_success': False,
-                        'long_result': {'success': False, 'error': 'Invalid short close price'},
-                        'short_result': {'success': False, 'error': 'Invalid short close price'},
-                    }
-                try:
-                    close_short_execution_price_int = self._price_to_int(
-                        close_short_execution_price,
-                        price_decimals,
-                        ROUND_UP,
-                    )
-                except ValueError as exc:
-                    logger.warning(
-                        "Failed to convert short close price to ticks for %s: %s",
-                        market_symbol,
-                        exc,
-                    )
-                    return {
-                        'long_success': False,
-                        'short_success': False,
-                        'long_result': {'success': False, 'error': 'Failed to encode short close price'},
-                        'short_result': {'success': False, 'error': 'Failed to encode short close price'},
-                    }
+                close_short_execution_price_int = 999999999
 
             if close_long or close_short:
                 limit_messages = []
                 if close_long:
-                    human_close_long_price = close_long_execution_price_int / price_scale
                     limit_messages.append(
-                        f"Long sell ≥ ${human_close_long_price:.6f} (ticks: {close_long_execution_price_int})"
+                        f"Long sell ≥ ${close_long_execution_price_int}"
                     )
                 if close_short:
-                    human_close_short_price = close_short_execution_price_int / price_scale
                     limit_messages.append(
-                        f"Short buy ≤ ${human_close_short_price:.6f} (ticks: {close_short_execution_price_int})"
+                        f"Short buy ≤ ${close_short_execution_price_int}"
                     )
                 logger.info(
-                    "  Close limits -> %s (max slippage %.2f%%)",
+                    "  Close limits -> %s",
                     " | ".join(limit_messages),
-                    max_slippage * 100,
                 )
 
             # Close commands
@@ -1337,6 +1272,7 @@ async def main():
     # Load configuration
     try:
         config = BotConfig.from_env()
+        config.load_cache()
         config.validate()
     except Exception as e:
         logger.error(f"Configuration error: {e}")
