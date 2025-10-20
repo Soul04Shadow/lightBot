@@ -58,6 +58,7 @@ class DeltaNeutralOrchestrator:
         self.trade_count = 0
         self.success_count = 0
         self.is_running = False
+        self.stop_reason: Optional[str] = None
         self.open_positions = []
         self.close_retry_backoff_seconds = 5
         self.max_close_retries = 3
@@ -182,11 +183,13 @@ class DeltaNeutralOrchestrator:
                     )
 
         if breaches:
+            breach_details = '; '.join(breaches)
             logger.critical(
                 "🚨 Balance floor breached during %s -> %s. Halting new trades.",
                 context,
-                '; '.join(breaches),
+                breach_details,
             )
+            self.stop_reason = f"Balance floor breached during {context}: {breach_details}"
             self.is_running = False
             return False
 
@@ -263,13 +266,15 @@ class DeltaNeutralOrchestrator:
 
     def _log_session_summary(self, prefix: str = "Session stats") -> None:
         """Emit a summary log line with cumulative session metrics."""
+        reason_suffix = f" | halt_reason={self.stop_reason}" if self.stop_reason else ""
         logger.info(
-            "%s -> total_notional=$%.2f | long_volume=%.6f | short_volume=%.6f | net_bleed=$%.2f",
+            "%s -> total_notional=$%.2f | long_volume=%.6f | short_volume=%.6f | net_bleed=$%.2f%s",
             prefix,
             self.total_notional,
             self.total_volume_long,
             self.total_volume_short,
             self.realized_bleed,
+            reason_suffix,
         )
 
     async def _finalize_trade(self, position_info: dict) -> None:
@@ -296,6 +301,20 @@ class DeltaNeutralOrchestrator:
         trade_bleed = delta_long + delta_short
 
         self.realized_bleed += trade_bleed
+
+        max_session_bleed = getattr(self.config, 'max_session_bleed', None)
+        if max_session_bleed is not None and self.realized_bleed <= max_session_bleed:
+            reason = (
+                f"Session bleed ${self.realized_bleed:.2f} reached floor ${max_session_bleed:.2f}"
+            )
+            if self.stop_reason != reason:
+                logger.critical(
+                    "🚨 Session bleed limit reached (%.2f <= %.2f). Halting new trades.",
+                    self.realized_bleed,
+                    max_session_bleed,
+                )
+            self.stop_reason = reason
+            self.is_running = False
 
         market_index = position_info.get('market_index')
         if market_index in self.market_stats:
@@ -1211,6 +1230,7 @@ class DeltaNeutralOrchestrator:
     async def run_continuous(self):
         """Run continuous trading with configured interval"""
         self.is_running = True
+        self.stop_reason = None
 
         # Update leverage on both accounts first
         await self.update_leverage_both_accounts()
