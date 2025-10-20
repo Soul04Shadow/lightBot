@@ -5,6 +5,7 @@ Handles loading, validation, and management of bot configuration
 from environment variables.
 """
 
+import json
 import logging
 import os
 import time
@@ -65,6 +66,31 @@ class BotConfig:
     _market_info_cache: Dict[int, Tuple[dict, float]] = field(default_factory=dict, init=False, repr=False)
     _size_decimal_cache: Dict[int, Tuple[int, float]] = field(default_factory=dict, init=False, repr=False)
     
+    def load_cache(self, cache_file: str = 'market_cache.json'):
+        """Load market metadata from a JSON file."""
+        try:
+            if os.path.exists(cache_file):
+                with open(cache_file, 'r') as f:
+                    cache_data = json.load(f)
+                    self._market_info_cache = cache_data.get('market_info', {})
+                    self._size_decimal_cache = cache_data.get('size_decimals', {})
+                    logger.info(f"Loaded market cache from {cache_file}")
+        except Exception as e:
+            logger.warning(f"Could not load market cache: {e}")
+
+    def save_cache(self, cache_file: str = 'market_cache.json'):
+        """Save market metadata to a JSON file."""
+        try:
+            cache_data = {
+                'market_info': self._market_info_cache,
+                'size_decimals': self._size_decimal_cache,
+            }
+            with open(cache_file, 'w') as f:
+                json.dump(cache_data, f)
+            logger.info(f"Saved market cache to {cache_file}")
+        except Exception as e:
+            logger.warning(f"Could not save market cache: {e}")
+
     @classmethod
     def from_env(cls) -> 'BotConfig':
         """Load configuration from environment variables"""
@@ -187,7 +213,7 @@ class BotConfig:
         return (self._current_time() - timestamp) < self.market_metadata_ttl_seconds
 
     def get_cached_market_info(self, market_id: int) -> Optional[dict]:
-        entry = self._market_info_cache.get(market_id)
+        entry = self._market_info_cache.get(str(market_id))
         if not entry:
             return None
 
@@ -201,10 +227,11 @@ class BotConfig:
         return None
 
     def cache_market_info(self, market_id: int, info: dict) -> None:
-        self._market_info_cache[market_id] = (info, self._current_time())
+        self._market_info_cache[str(market_id)] = (info, self._current_time())
+        self.save_cache()
 
     def get_cached_size_decimals(self, market_id: int) -> Optional[int]:
-        entry = self._size_decimal_cache.get(market_id)
+        entry = self._size_decimal_cache.get(str(market_id))
         if not entry:
             return None
 
@@ -218,7 +245,8 @@ class BotConfig:
         return None
 
     def cache_size_decimals(self, market_id: int, decimals: int) -> None:
-        self._size_decimal_cache[market_id] = (decimals, self._current_time())
+        self._size_decimal_cache[str(market_id)] = (decimals, self._current_time())
+        self.save_cache()
 
     @asynccontextmanager
     async def api_client(self):
