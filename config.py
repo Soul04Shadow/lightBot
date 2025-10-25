@@ -23,7 +23,8 @@ logger = logging.getLogger(__name__)
 class BotConfig:
     """Bot configuration loaded from environment variables"""
     
-    # Lighter API
+    # API Adapter Configuration
+    api_adapter: str  # Name of the API adapter to use (e.g., 'lighter', 'paradex')
     base_url: str
     
     # Account 1 (Long positions)
@@ -227,15 +228,19 @@ class BotConfig:
                     telegram_broadcast_chat_id = int(broadcast_chat_raw.strip())
                 except ValueError as exc:
                     raise ValueError(
-                        'TELEGRAM_BROADCAST_CHAT_ID must be a valid integer chat ID'
-                    ) from exc
+                    f"TELEGRAM_BROADCAST_CHAT_ID must be a valid integer chat ID"
+                ) from exc
         else:
             if operator_ids_raw or broadcast_chat_raw:
                 logger.warning(
                     "Telegram chat IDs provided without TELEGRAM_BOT_TOKEN; notifier will be disabled."
                 )
 
+        # Get API adapter name (defaults to 'lighter' for backward compatibility)
+        api_adapter = get_optional_env('API_ADAPTER', 'lighter').lower()
+
         return cls(
+            api_adapter=api_adapter,
             base_url=get_optional_env('BASE_URL', 'https://testnet.zklighter.elliot.ai'),
             account1_private_key=ensure_0x_prefix(get_required_env('ACCOUNT1_PRIVATE_KEY')),
             account1_index=int(get_required_env('ACCOUNT1_INDEX')),
