@@ -1,0 +1,26 @@
+{
+    "exchanges": {
+        "variational": {
+            "base_url": "https://omni.variational.io/perpetual/BTC",
+            "user_data_dir": "./browser_profile",
+            "selectors": {
+                "connect_wallet_btn": "button:has-text('Connect Wallet')",
+                "account_details": ".portfolio-details",
+                "balance_text": ".portfolio-details span.text-blackwhite",
+                "market_tab": "div[data-testid='toggle-select'] button:has-text('Market')",
+                "size_input": "input[data-testid='quantity-input']",
+                "buy_btn": "span[role='switch'] button:has-text('Buy')",
+                "sell_btn": "span[role='switch'] button:has-text('Sell')",
+                "submit_btn": "button[data-testid='submit-button']",
+                "order_confirm_modal_btn": "button[data-testid='confirm-order']",
+                "leverage_open_btn": "button[data-testid='leverage-button']",
+                "leverage_input": "input[data-testid='leverage-input']",
+                "leverage_confirm_btn": "button[data-testid='confirm-leverage']",
+                "success_toast": ".Toastify__toast--success"
+            }
+        },
+        "lighter": {
+            "base_url": "https://api.lighter.xyz"
+        }
+    }
+}

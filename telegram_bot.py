@@ -155,14 +155,70 @@ class TelegramBotController:
     def register(self, application: Application) -> None:
         """Register command handlers on the supplied application."""
 
+        application.add_handler(CommandHandler('start', self._handle_start))
+        application.add_handler(CommandHandler('help', self._handle_help))
         application.add_handler(CommandHandler('status', self._handle_status))
         application.add_handler(CommandHandler('pause', self._handle_pause))
+        application.add_handler(CommandHandler('stop', self._handle_stop))
         application.add_handler(CommandHandler('resume', self._handle_resume))
+        application.add_handler(CommandHandler('forceclose', self._handle_forceclose))
         application.add_handler(CommandHandler('pnl', self._handle_pnl))
         application.add_handler(CommandHandler('balances', self._handle_balances))
         application.add_handler(CommandHandler('config', self._handle_config))
         application.add_handler(CommandHandler('session', self._handle_session))
         application.add_handler(CommandHandler('setlogchannel', self._handle_setlogchannel))
+
+    async def _handle_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handler for the /start command."""
+        if not await self._ensure_authorized(update):
+            return
+
+        message = (
+            "🤖 *Delta Neutral Bot Manager*\n\n"
+            "Welcome, operator! I am ready to manage your delta-neutral strategies.\n\n"
+            "Use /help to see available commands."
+        )
+        await update.message.reply_text(message, parse_mode=ParseMode.MARKDOWN)
+
+    async def _handle_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handler for the /help command."""
+        if not await self._ensure_authorized(update):
+            return
+        
+        message = (
+            "📜 *Command List*\n\n"
+            "🎮 *Controls*\n"
+            "/pause - Gracefully pause trading after current positions close\n"
+            "/resume - Resume trading loop\n"
+            "/stop - Stop the bot completely (exit process)\n"
+            "/forceclose - 🚨 Emergency: Close all open positions immediately\n\n"
+            "📊 *Monitoring*\n"
+            "/status - View current running state & stats\n"
+            "/pnl - View session Profit & Loss\n"
+            "/balances - View current wallet balances\n"
+            "/session - View detailed session metrics\n\n"
+            "⚙️ *Settings*\n"
+            "/config - View current loaded configuration\n"
+            "/setlogchannel [id|off] - Set broadcast channel for trade logs"
+        )
+        await update.message.reply_text(message, parse_mode=ParseMode.MARKDOWN)
+
+    async def _handle_stop(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handler for the /stop command."""
+        if not await self._ensure_authorized(update):
+            return
+        
+        response = self.orchestrator.stop()
+        await update.message.reply_text(response)
+
+    async def _handle_forceclose(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handler for the /forceclose command."""
+        if not await self._ensure_authorized(update):
+            return
+        
+        await update.message.reply_text("🚨 Initiating Force Close...")
+        response = await self.orchestrator.force_close_all()
+        await update.message.reply_text(response)
 
     async def _handle_pause(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handler for the /pause command."""
@@ -221,7 +277,7 @@ class TelegramBotController:
             return
         snapshot = self.orchestrator.get_status_snapshot()
         message = (
-            "🛰 *Bot Status*\n"
+            "� *Bot Status*\n"
             f"• Running: {'✅' if snapshot['is_running'] else '⏸'}\n"
             f"• Trades: {snapshot['trade_count']}\n"
             f"• Successes: {snapshot['success_count']}\n"

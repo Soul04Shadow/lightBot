@@ -27,3 +27,4 @@ colorlog>=6.7.0
 
 # Telegram bot integration
 python-telegram-bot
+playwright>=1.40.0

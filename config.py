@@ -12,7 +12,7 @@ import os
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import lighter
 
@@ -63,6 +63,9 @@ class BotConfig:
     min_account1_balance: Optional[float] = None
     min_account2_balance: Optional[float] = None
     min_combined_balance: Optional[float] = None
+    
+    # Account Pool (for stealth/scaling)
+    account_pool: List[Dict[str, Any]] = field(default_factory=list)
 
     # Telegram integration
     telegram_bot_token: Optional[str] = None
@@ -72,6 +75,66 @@ class BotConfig:
     _market_info_cache: Dict[int, Tuple[dict, float]] = field(default_factory=dict, init=False, repr=False)
     _size_decimal_cache: Dict[int, Tuple[int, float]] = field(default_factory=dict, init=False, repr=False)
     
+    def __post_init__(self):
+        # 1. Load Exchange Configurations from JSON (Selectors etc)
+        exchange_config = {}
+        try:
+            config_path = 'exchange_config.json'
+            if os.path.exists(config_path):
+                with open(config_path, 'r') as f:
+                    exchange_config = json.load(f).get('exchanges', {})
+                    logger.info(f"Loaded exchange configs for: {list(exchange_config.keys())}")
+        except Exception as e:
+            logger.warning(f"Could not load exchange_config.json: {e}")
+
+        # 2. Initialize pool from individual accounts if empty
+        if not self.account_pool:
+            # Helper to build account dict
+            def build_account(prefix, index, default_exchange='lighter'):
+                # Basic Env Vars
+                pk = os.getenv(f'{prefix}_PRIVATE_KEY')
+                if not pk: return None
+                
+                acc_idx = int(os.getenv(f'{prefix}_INDEX', 0))
+                api_idx = int(os.getenv(f'{prefix}_API_KEY_INDEX', 0))
+                exchange_type = os.getenv(f'{prefix}_EXCHANGE_TYPE', default_exchange).lower()
+                user_data_dir = os.getenv(f'{prefix}_USER_DATA_DIR')
+                
+                # Start with Env config
+                acc_config = {
+                    'private_key': pk,
+                    'account_index': acc_idx,
+                    'api_key_index': api_idx,
+                    'exchange_type': exchange_type,
+                    'alias': f'Account {index}',
+                    'user_data_dir': user_data_dir
+                }
+                
+                # Merge JSON Defaults (Base URL, Selectors)
+                defaults = exchange_config.get(exchange_type, {})
+                
+                # Base URL: Env overrides JSON overrides Default
+                acc_config['base_url'] = os.getenv(f'{prefix}_BASE_URL') or defaults.get('base_url') or self.base_url
+                
+                # Selectors: JSON is source of truth, Env can override strict keys if needed (rare)
+                acc_config['selectors'] = defaults.get('selectors', {})
+                
+                return acc_config
+
+            # Account 1
+            acc1 = build_account('ACCOUNT1', 1)
+            if acc1: self.account_pool.append(acc1)
+            
+            # Account 2
+            acc2 = build_account('ACCOUNT2', 2)
+            if acc2: self.account_pool.append(acc2)
+            
+            # Extra Accounts (3-10)
+            for i in range(3, 11):
+                acc = build_account(f'ACCOUNT{i}', i, default_exchange='lighter')
+                if acc:
+                    self.account_pool.append(acc)
+
     def load_cache(self, cache_file: str = 'market_cache.json'):
         """Load market metadata from a JSON file."""
         try:
