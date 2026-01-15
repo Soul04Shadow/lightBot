@@ -24,7 +24,7 @@ async def test_live_trading():
         return
 
     variational_config = config_data['exchanges']['variational']
-    variational_config['headless'] = False  # MUST be False to see browser and connect wallet
+    variational_config['headless'] = True  # Changed to True for VPS execution
     
     # HARDCODED PROXY FOR TESTING
     variational_config['proxy'] = "http://1094e25ebecf409867bc__cr.in:ff91fa86de6667b5@gw.dataimpulse.com:10000"

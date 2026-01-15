@@ -32,24 +32,41 @@ class BrowserExchange(ExchangeClient):
             # Proxy Configuration
             proxy_settings = None
             if self.proxy_url:
-                proxy_settings = {"server": self.proxy_url}
-                # If these are separate in your config, you can map them:
-                # if 'proxy_username' in self.config: proxy_settings['username'] = ...
+                from urllib.parse import urlparse
+                parsed = urlparse(self.proxy_url)
+                
+                # Extract credentials if present in URL
+                if parsed.username and parsed.password:
+                    proxy_settings = {
+                        "server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}",
+                        "username": parsed.username,
+                        "password": parsed.password
+                    }
+                else:
+                    proxy_settings = {"server": self.proxy_url}
 
             launch_args = {
                 "headless": self.headless,
                 "args": ["--disable-blink-features=AutomationControlled"], # Basic stealth
-                "proxy": proxy_settings
             }
-
+            
+            # NOTE: When using launch_persistent_context, proxy MUST be passed in launch_args
             if self.user_data_dir:
+                if proxy_settings:
+                    launch_args["proxy"] = proxy_settings
+                    
                 self.context = await self.playwright.chromium.launch_persistent_context(
                     user_data_dir=self.user_data_dir,
                     **launch_args
                 )
             else:
+                # For non-persistent, we pass proxy to launch() AND new_context() 
+                # passing it to launch() avoids the 'proxy login' popup in visible mode
+                if proxy_settings:
+                    launch_args["proxy"] = proxy_settings
+                    
                 self.browser = await self.playwright.chromium.launch(**launch_args)
-                self.context = await self.browser.new_context(proxy=proxy_settings)
+                self.context = await self.browser.new_context() # Proxy already inherited from launch
 
             self.page = await self.context.new_page()
             
