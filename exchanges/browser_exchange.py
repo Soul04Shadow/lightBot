@@ -22,15 +22,24 @@ class BrowserExchange(ExchangeClient):
         self.url = config.get('base_url')
         self.headless = config.get('headless', False) # Default to visible for debugging
         self.user_data_dir = config.get('user_data_dir', None) # For persistent logins
+        self.proxy_url = config.get('proxy', None)
 
     async def initialize(self) -> bool:
         """Launches the browser and navigates to the exchange."""
         try:
             self.playwright = await async_playwright().start()
             
+            # Proxy Configuration
+            proxy_settings = None
+            if self.proxy_url:
+                proxy_settings = {"server": self.proxy_url}
+                # If these are separate in your config, you can map them:
+                # if 'proxy_username' in self.config: proxy_settings['username'] = ...
+
             launch_args = {
                 "headless": self.headless,
-                "args": ["--disable-blink-features=AutomationControlled"] # Basic stealth
+                "args": ["--disable-blink-features=AutomationControlled"], # Basic stealth
+                "proxy": proxy_settings
             }
 
             if self.user_data_dir:
@@ -40,7 +49,7 @@ class BrowserExchange(ExchangeClient):
                 )
             else:
                 self.browser = await self.playwright.chromium.launch(**launch_args)
-                self.context = await self.browser.new_context()
+                self.context = await self.browser.new_context(proxy=proxy_settings)
 
             self.page = await self.context.new_page()
             

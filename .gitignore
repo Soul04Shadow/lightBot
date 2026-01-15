@@ -19,8 +19,14 @@ build/
 *.log
 logs/
 
+# Browser Data
+browser_profile/
+browser_profiles/
+headless_test_results/
+
 # IDE
 .vscode/
+*.code-workspace
 .idea/
 *.swp
 *.swo

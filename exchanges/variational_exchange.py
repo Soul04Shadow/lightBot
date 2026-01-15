@@ -30,11 +30,19 @@ class VariationalExchange(BrowserExchange):
             
         # Init API Session
         self.api_session = aiohttp.ClientSession()
+        
+        # Verify Connection/Setup
+        if not await self._post_launch_setup():
+            logger.error("Initialization Failed: Wallet not connected.")
+            await self.close()
+            return False
+            
         return True
 
-    async def _post_launch_setup(self):
+    async def _post_launch_setup(self) -> bool:
         """
         Wait for Variational UI to load and ensure Wallet is connected.
+        Returns: True if connected and ready, False otherwise.
         """
         s = self.config.get('selectors', {})
         try:
@@ -43,47 +51,56 @@ class VariationalExchange(BrowserExchange):
             await self.page.wait_for_load_state('networkidle', timeout=20000)
             
             # 2. Ensure Wallet Connection
-            await self._ensure_wallet_connected(s)
+            connected = await self._ensure_wallet_connected(s)
+            return connected
 
         except Exception as e:
             logger.warning(f"Startup warning: {e}")
+            return False
 
     async def _ensure_wallet_connected(self, selectors: Dict):
         """Checks for connection and attempts to connect if disconnected."""
         logger.info("Verifying Wallet Connection...")
         
-        # Method A: Check if 'Account Details' or 'Balance' element is visible (Sign of connection)
         success_indicator = selectors.get('account_details', '.portfolio-details')
-        try:
-            await self.page.wait_for_selector(success_indicator, state='visible', timeout=5000)
-            logger.info("Wallet detected as CONNECTED.")
-            return True
-        except Exception:
-            logger.info("Wallet not detected. Attempting to connect...")
+        connect_btn = selectors.get('connect_wallet_btn', "button:has-text('Connect Wallet')")
 
-        # Method B: Attempt to click 'Connect Wallet'
-        connect_btn = selectors.get('connect_wallet_btn')
-        if connect_btn:
+        # Retry loop for initial connection (e.g., waiting for user logic)
+        max_retries = 3
+        
+        for i in range(max_retries):
+            # 1. Check if already connected
             try:
-                # Click logic
+                if await self.page.is_visible(success_indicator):
+                    logger.info("Wallet detected as CONNECTED.")
+                    return True
+            except Exception:
+                pass
+
+            # 2. Not connected? Try to click Connect
+            logger.info(f"Wallet not connected. Attempt {i+1}/{max_retries} to connect...")
+            try:
                 if await self.page.is_visible(connect_btn):
-                    logger.info(f"Clicking {connect_btn}...")
+                    logger.info("Clicking Connect Wallet button...")
                     await self.page.click(connect_btn)
                     
-                    # Wait for user to handle extension popup
-                    # We can't automate the extension popup easily, but we can wait until connection succeeds
-                    logger.info("Waiting for user to approve wallet connection...")
+                    # Wait for user action
+                    logger.info("Waiting 30s for wallet connection...")
                     try:
-                        await self.page.wait_for_selector(success_indicator, state='visible', timeout=60000) # 60s wait
+                        await self.page.wait_for_selector(success_indicator, state='visible', timeout=30000)
                         logger.info("Wallet connected successfully!")
                         return True
                     except Exception:
-                        logger.error("Timed out waiting for wallet connection.")
-                        return False
+                        logger.warning("Timed out waiting for user to connect wallet.")
             except Exception as e:
-                logger.error(f"Error clicking connect button: {e}")
-        
-        return False
+                logger.debug(f"Connect button interaction failed: {e}")
+            
+            # Short wait before retry
+            await asyncio.sleep(2)
+            
+        logger.error("Failed to establish wallet connection after retries.")
+        # Final check
+        return await self.page.is_visible(success_indicator)
 
     async def get_orderbook_price(self, symbol: str) -> Tuple[float, float]:
         """
