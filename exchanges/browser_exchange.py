@@ -94,17 +94,8 @@ class BrowserExchange(ExchangeClient):
                 "user_agent": user_agent,
                 "viewport": {"width": 1920, "height": 1080},
                 "ignore_default_args": ["--enable-automation"],
-                "chrome_sxs": False,
                 "channel": "chrome" # Try to use installed Chrome if available for better stealth
             }
-
-            # Fallback if channel fails (Playwright bundled)
-            try:
-                # We attempt to set channel, but if it fails we might need to catch it. 
-                # Actually, launch_persistent_context handles args well.
-                pass
-            except:
-                del common_args["channel"]
 
             if launch_proxy:
                 common_args["proxy"] = launch_proxy
@@ -114,20 +105,40 @@ class BrowserExchange(ExchangeClient):
                 # Persistent Context: http_credentials goes directly here
                 if http_credentials:
                     common_args["http_credentials"] = http_credentials
-                    
-                self.context = await self.playwright.chromium.launch_persistent_context(
-                    user_data_dir=self.user_data_dir,
-                    **common_args
-                )
+                
+                try:
+                    self.context = await self.playwright.chromium.launch_persistent_context(
+                        user_data_dir=self.user_data_dir,
+                        **common_args
+                    )
+                except Exception as e:
+                    # Fallback: Try without 'channel' (use bundled Chromium)
+                    if "channel" in common_args:
+                        logger.warning(f"Launch with channel='chrome' failed ({e}). Retrying with bundled Chromium...")
+                        del common_args["channel"]
+                        self.context = await self.playwright.chromium.launch_persistent_context(
+                            user_data_dir=self.user_data_dir,
+                            **common_args
+                        )
+                    else:
+                        raise e
             else:
                 # Non-Persistent: Launch -> New Context (with credentials)
                 # Note: launch() doesn't take user_agent/viewport, new_context() does.
-                # We need to split them.
                 
                 # Filter args for direct launch
-                launch_args = {k: v for k, v in common_args.items() if k in ['headless', 'args', 'proxy', 'channel', 'ignore_default_args', 'chrome_sxs']}
+                launch_keys = ['headless', 'args', 'proxy', 'channel', 'ignore_default_args']
+                launch_args = {k: v for k, v in common_args.items() if k in launch_keys}
                 
-                self.browser = await self.playwright.chromium.launch(**launch_args)
+                try:
+                    self.browser = await self.playwright.chromium.launch(**launch_args)
+                except Exception as e:
+                    if "channel" in launch_args:
+                        logger.warning(f"Launch with channel='chrome' failed. Retrying with bundled Chromium...")
+                        del launch_args["channel"]
+                        self.browser = await self.playwright.chromium.launch(**launch_args)
+                    else:
+                        raise e
                 
                 context_args = {
                     "user_agent": user_agent,
