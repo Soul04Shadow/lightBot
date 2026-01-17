@@ -73,19 +73,38 @@ class BrowserExchange(ExchangeClient):
                     raise
 
             # 2. Prepare Launch Args
-            # Add Linux stability args
+            # Add Linux stability args & Stealth args
             stability_args = [
                 "--disable-blink-features=AutomationControlled",
                 "--disable-gpu",
                 "--no-sandbox", 
                 "--disable-dev-shm-usage",
-                "--disable-features=VizDisplayCompositor"
+                "--disable-features=VizDisplayCompositor",
+                "--disable-infobars",
+                "--window-size=1920,1080",
+                "--start-maximized"
             ]
+
+            # Use a fixed, real User-Agent to prevent 'Headless' detection
+            user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36"
 
             common_args = {
                 "headless": self.headless,
                 "args": stability_args,
+                "user_agent": user_agent,
+                "viewport": {"width": 1920, "height": 1080},
+                "ignore_default_args": ["--enable-automation"],
+                "chrome_sxs": False,
+                "channel": "chrome" # Try to use installed Chrome if available for better stealth
             }
+
+            # Fallback if channel fails (Playwright bundled)
+            try:
+                # We attempt to set channel, but if it fails we might need to catch it. 
+                # Actually, launch_persistent_context handles args well.
+                pass
+            except:
+                del common_args["channel"]
 
             if launch_proxy:
                 common_args["proxy"] = launch_proxy
@@ -102,13 +121,29 @@ class BrowserExchange(ExchangeClient):
                 )
             else:
                 # Non-Persistent: Launch -> New Context (with credentials)
-                self.browser = await self.playwright.chromium.launch(**common_args)
+                # Note: launch() doesn't take user_agent/viewport, new_context() does.
+                # We need to split them.
                 
-                context_args = {}
+                # Filter args for direct launch
+                launch_args = {k: v for k, v in common_args.items() if k in ['headless', 'args', 'proxy', 'channel', 'ignore_default_args', 'chrome_sxs']}
+                
+                self.browser = await self.playwright.chromium.launch(**launch_args)
+                
+                context_args = {
+                    "user_agent": user_agent,
+                    "viewport": {"width": 1920, "height": 1080}
+                }
                 if http_credentials:
                     context_args["http_credentials"] = http_credentials
                     
                 self.context = await self.browser.new_context(**context_args)
+
+            # STEALTH: Apply script to mask webdriver property
+            await self.context.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', {
+                    get: () => undefined
+                });
+            """)
 
             self.page = await self.context.new_page() if not self.user_data_dir else self.context.pages[0]
             
