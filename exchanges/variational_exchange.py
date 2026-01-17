@@ -179,23 +179,6 @@ class VariationalExchange(BrowserExchange):
         except Exception as e:
             logger.debug(f"Error checking captcha: {e}")
             return False
-                    for w in range(24): # 2 mins (24 * 5s)
-                        await asyncio.sleep(5)
-                        # Check if gone
-                        still_there = False
-                        for sel in captcha_selectors:
-                            if await self.page.is_visible(sel):
-                                still_there = True
-                                break
-                        if not still_there:
-                            logger.info("Captcha appears to be resolved.")
-                            return
-                    logger.error("Captcha timed out. Manual intervention required.")
-                    return
-
-                await asyncio.sleep(1)
-        except Exception as e:
-            logger.debug(f"Error checking captcha: {e}")
 
     async def _ensure_wallet_connected(self, selectors: Dict):
         """Checks for connection and attempts to connect if disconnected."""
