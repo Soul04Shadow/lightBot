@@ -25,8 +25,7 @@ async def test_live_trading():
 
     variational_config = config_data['exchanges']['variational']
     
-    # NOTICE: 'headless' preference should be set in exchange_config.json or .env
-    # We do NOT force it to True here anymore.
+    variational_config['headless'] = True  # Enable Headless Mode by default
     
     # Optional: Test Proxy (Uncomment to force a specific proxy for testing)
     # variational_config['proxy'] = "http://user:pass@host:port"

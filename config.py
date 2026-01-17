@@ -99,7 +99,8 @@ class BotConfig:
                 api_idx = int(os.getenv(f'{prefix}_API_KEY_INDEX', 0))
                 exchange_type = os.getenv(f'{prefix}_EXCHANGE_TYPE', default_exchange).lower()
                 user_data_dir = os.getenv(f'{prefix}_USER_DATA_DIR')
-                
+                proxy_url = os.getenv(f'{prefix}_PROXY')  # Add Proxy support per account
+
                 # Start with Env config
                 acc_config = {
                     'private_key': pk,
@@ -107,7 +108,8 @@ class BotConfig:
                     'api_key_index': api_idx,
                     'exchange_type': exchange_type,
                     'alias': f'Account {index}',
-                    'user_data_dir': user_data_dir
+                    'user_data_dir': user_data_dir,
+                    'proxy': proxy_url
                 }
                 
                 # Merge JSON Defaults (Base URL, Selectors)

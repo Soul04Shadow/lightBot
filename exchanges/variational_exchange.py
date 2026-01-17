@@ -23,7 +23,12 @@ class VariationalExchange(BrowserExchange):
         self.api_session = None
 
     async def initialize(self) -> bool:
-        # Init Browser
+        """
+        Initializes the browser and API session.
+        Implements 'Headless -> Interactive -> Headless' flow for authentication.
+        """
+        # 1. First Attempt: Launch with configured headless setting (usually True)
+        logger.info(f"Initializing {self.config.get('alias', 'Browser')} (Headless: {self.headless})...")
         browser_success = await super().initialize()
         if not browser_success:
             return False
@@ -31,13 +36,64 @@ class VariationalExchange(BrowserExchange):
         # Init API Session
         self.api_session = aiohttp.ClientSession()
         
-        # Verify Connection/Setup
-        if not await self._post_launch_setup():
-            logger.error("Initialization Failed: Wallet not connected.")
-            await self.close()
-            return False
+        # 2. Verify Connection
+        # If we are headless and NOT connected, we need to switch modes.
+        try:
+            connected = await self._post_launch_setup()
             
-        return True
+            if not connected and self.headless:
+                logger.warning("Wallet NOT connected/authenticated in Headless mode.")
+                logger.info("Restarting in HEADED mode for user interaction...")
+                
+                # Close current headless instance
+                await self.close()
+                
+                # Relaunch in Headed Mode
+                original_headless = self.headless
+                self.headless = False
+                self.config['headless'] = False # Ensure it sticks for this run
+                
+                logger.info(">>> PLEASE CONNECT WALLET IN THE BROWSER WINDOW <<<")
+                
+                if not await super().initialize():
+                    logger.error("Failed to launch headed browser.")
+                    return False
+                
+                # Restore API session if needed (it persists, but good to be safe)
+                if not self.api_session or self.api_session.closed:
+                    self.api_session = aiohttp.ClientSession()
+
+                # Wait for user to connect (using the robust wait logic)
+                connected = await self._post_launch_setup()
+                
+                if connected:
+                    logger.info("Authentication SUCCESSFUL!")
+                    logger.info("Restarting in HEADLESS mode with saved session...")
+                    await asyncio.sleep(2) # Brief pause to ensure cookies save
+                    await self.close()
+                    
+                    # Back to Headless
+                    self.headless = original_headless
+                    self.config['headless'] = original_headless
+                    
+                    if not await super().initialize():
+                        return False
+                        
+                    # Final Verification
+                    if not self.api_session or self.api_session.closed:
+                         self.api_session = aiohttp.ClientSession()
+                    
+                    return await self._post_launch_setup()
+                else:
+                    logger.error("Authentication failed or timed out in headed mode.")
+                    return False
+            
+            return connected
+
+        except Exception as e:
+             logger.error(f"Initialization flow error: {e}")
+             await self.close()
+             return False
 
     async def _post_launch_setup(self) -> bool:
         """
@@ -64,6 +120,16 @@ class VariationalExchange(BrowserExchange):
 
     async def _handle_captcha(self):
         """Checks for Cloudflare/Captcha and pauses/notifies if detected."""
+        if not self.headless:
+            # If we are visible, the user can handle it. Just log.
+             try:
+                 # Check briefly
+                 if await self.page.is_visible("iframe[title*='Cloudflare']"):
+                     logger.warning("Captcha visible! Please solve it in the browser.")
+             except:
+                 pass
+             return
+
         try:
             # Common patterns for Cloudflare or generic captchas
             captcha_selectors = [
@@ -145,7 +211,13 @@ class VariationalExchange(BrowserExchange):
                     
                     # Give time for Authentication / Sign Message (common in EVM apps)
                     # Use provided config 'auth_wait' or default to 15s
-                    auth_wait = self.config.get('auth_wait_time', 15)
+                    # Only wait if we are in HEADED mode (user interaction phase) OR explicit config
+                    auth_wait = self.config.get('auth_wait_time', 0)
+                    
+                    if not self.headless and auth_wait == 0:
+                        # Default waits for headed mode
+                        auth_wait = 15
+                        
                     if auth_wait > 0:
                         logger.info(f"Waiting {auth_wait}s for authentication signatures/popups...")
                         await asyncio.sleep(auth_wait)
