@@ -34,19 +34,43 @@ class BrowserExchange(ExchangeClient):
             http_credentials = None
 
             if self.proxy_url:
-                from urllib.parse import urlparse
-                parsed = urlparse(self.proxy_url)
-                
-                # Server is always required for launch
-                server_url = f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"
-                launch_proxy = {"server": server_url}
-
-                # Credentials go to context/http_credentials
-                if parsed.username and parsed.password:
-                    http_credentials = {
-                        "username": parsed.username,
-                        "password": parsed.password
-                    }
+                try:
+                    # Handle "host:port:username:password" format (common in proxy lists)
+                    # We define a helper to safely parse this without relying solely on urlparse's strict port integers
+                    proxy_str = self.proxy_url.strip()
+                    if "://" not in proxy_str:
+                        proxy_str = f"http://{proxy_str}"
+                    
+                    from urllib.parse import urlparse
+                    parsed = urlparse(proxy_str)
+                    
+                    # Check if we have the "host:port:user:pass" structure in the netloc
+                    # This often manifests as a ValueError when accessing parsed.port, or we can detect it by splitting
+                    netloc_parts = parsed.netloc.split(':')
+                    
+                    if len(netloc_parts) == 4:
+                        # Format: host:port:username:password
+                        server_url = f"{parsed.scheme}://{netloc_parts[0]}:{netloc_parts[1]}"
+                        http_credentials = {
+                            "username": netloc_parts[2],
+                            "password": netloc_parts[3]
+                        }
+                    else:
+                        # Standard format: http://user:pass@host:port or http://host:port
+                        # We use parsed properties. Accessing parsed.port might raise ValueError if malformed,
+                        # but standard format should work.
+                        server_url = f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"
+                        if parsed.username and parsed.password:
+                            http_credentials = {
+                                "username": parsed.username,
+                                "password": parsed.password
+                            }
+                            
+                    launch_proxy = {"server": server_url}
+                    
+                except Exception as e:
+                    logger.error(f"Failed to parse proxy URL '{self.proxy_url}': {e}")
+                    raise
 
             # 2. Prepare Launch Args
             # Add Linux stability args
