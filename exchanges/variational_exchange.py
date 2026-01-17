@@ -37,12 +37,13 @@ class VariationalExchange(BrowserExchange):
         self.api_session = aiohttp.ClientSession()
         
         # 2. Verify Connection
-        # If we are headless and NOT connected, we need to switch modes.
+        # If we are headless and NOT connected (OR have captcha), we need to switch modes.
         try:
             connected = await self._post_launch_setup()
             
+            # If failed (due to captcha OR wallet), switch to Headed
             if not connected and self.headless:
-                logger.warning("Wallet NOT connected/authenticated in Headless mode.")
+                logger.warning("Setup incomplete (Wallet missing or Captcha detected) in Headless mode.")
                 logger.info("Restarting in HEADED mode for user interaction...")
                 
                 # Close current headless instance
@@ -53,7 +54,7 @@ class VariationalExchange(BrowserExchange):
                 self.headless = False
                 self.config['headless'] = False # Ensure it sticks for this run
                 
-                logger.info(">>> PLEASE CONNECT WALLET IN THE BROWSER WINDOW <<<")
+                logger.info(">>> PLEASE CONNECT WALLET / SOLVE CAPTCHA IN THE BROWSER WINDOW <<<")
                 
                 if not await super().initialize():
                     logger.error("Failed to launch headed browser.")
@@ -67,7 +68,7 @@ class VariationalExchange(BrowserExchange):
                 connected = await self._post_launch_setup()
                 
                 if connected:
-                    logger.info("Authentication SUCCESSFUL!")
+                    logger.info("Setup SUCCESSFUL!")
                     logger.info("Restarting in HEADLESS mode with saved session...")
                     await asyncio.sleep(2) # Brief pause to ensure cookies save
                     await self.close()
@@ -85,7 +86,7 @@ class VariationalExchange(BrowserExchange):
                     
                     return await self._post_launch_setup()
                 else:
-                    logger.error("Authentication failed or timed out in headed mode.")
+                    logger.error("Setup failed in headed mode.")
                     return False
             
             return connected
@@ -105,12 +106,25 @@ class VariationalExchange(BrowserExchange):
             logger.info("Waiting for Variational UI to load...")
             
             # 0. Check for Captcha / Cloudflare
-            await self._handle_captcha()
+            # If captcha detected in HEADLESS mode, return False immediately to trigger Restart-as-Headed
+            if await self._handle_captcha():
+                if self.headless:
+                    logger.warning("Captcha detected in Headless Mode. Aborting setup to restart with UI.")
+                    return False
 
             # 1. Wait for basic UI structure
-            await self.page.wait_for_load_state('networkidle', timeout=20000)
+            try:
+                await self.page.wait_for_load_state('networkidle', timeout=20000)
+            except:
+                pass # Continue processing
             
-            # 2. Ensure Wallet Connection
+            # 2. Re-Check Captcha (Load might have triggered it)
+            if await self._handle_captcha():
+                if self.headless:
+                     logger.warning("Captcha detected after load. Aborting setup to restart with UI.")
+                     return False
+
+            # 3. Ensure Wallet Connection
             connected = await self._ensure_wallet_connected(s)
             return connected
 
@@ -118,36 +132,53 @@ class VariationalExchange(BrowserExchange):
             logger.warning(f"Startup warning: {e}")
             return False
 
-    async def _handle_captcha(self):
-        """Checks for Cloudflare/Captcha and pauses/notifies if detected."""
-        if not self.headless:
-            # If we are visible, the user can handle it. Just log.
-             try:
-                 # Check briefly
-                 if await self.page.is_visible("iframe[title*='Cloudflare']"):
-                     logger.warning("Captcha visible! Please solve it in the browser.")
-             except:
-                 pass
-             return
-
+    async def _handle_captcha(self) -> bool:
+        """
+        Checks for Cloudflare/Captcha.
+        Returns: True if Captcha is present/blocking, False if clear.
+        """
         try:
-            # Common patterns for Cloudflare or generic captchas
+            # Common patterns for Cloudflare or generic captchas + Specific App Popup
             captcha_selectors = [
                  "iframe[title*='Cloudflare']",
                  "div:has-text('Verify you are human')",
-                 "div:has-text('Checking if the site connection is secure')"
+                 "div:has-text('Checking if the site connection is secure')",
+                 "div:has-text('Bots Activity Detected')", # Specific App Popup
+                 "div:has-text('Please complete the Captcha below')"
             ]
             
-            for _ in range(3): # Quick checks
-                found = False
-                for sel in captcha_selectors:
-                    if await self.page.is_visible(sel):
-                        found = True
-                        break
-                
-                if found:
-                    logger.warning("CAPTCHA DETECTED! Waiting up to 2 minutes for resolution...")
-                    # Wait loop
+            found = False
+            for sel in captcha_selectors:
+                if await self.page.is_visible(sel):
+                    found = True
+                    break
+            
+            if found:
+                if not self.headless:
+                    logger.warning("CAPTCHA Visible! Please solve it in the browser window.")
+                    # In Headed mode, we just return True (it's present), letting the caller/user handle it.
+                    # Or we could loop here waiting for it to clear?
+                    # Better to loop here so we don't proceed to wallet check until cleared.
+                    logger.info("Waiting for Captcha resolution...")
+                    for _ in range(60): # Wait 5 mins max (60*5)
+                        await asyncio.sleep(5)
+                        still_there = False
+                        for sel in captcha_selectors:
+                            if await self.page.is_visible(sel):
+                                still_there = True
+                                break
+                        if not still_there:
+                            logger.info("Captcha resolved.")
+                            return False # Cleared
+                    return True # Stuck
+                else:
+                    return True # Headless + Captcha = Bail out to restart
+
+            return False
+            
+        except Exception as e:
+            logger.debug(f"Error checking captcha: {e}")
+            return False
                     for w in range(24): # 2 mins (24 * 5s)
                         await asyncio.sleep(5)
                         # Check if gone
