@@ -142,6 +142,14 @@ class VariationalExchange(BrowserExchange):
                     # Double check balance isn't empty/loading?
                     # For now, this is a strong signal of connection.
                     logger.info("Wallet detected as CONNECTED.")
+                    
+                    # Give time for Authentication / Sign Message (common in EVM apps)
+                    # Use provided config 'auth_wait' or default to 15s
+                    auth_wait = self.config.get('auth_wait_time', 15)
+                    if auth_wait > 0:
+                        logger.info(f"Waiting {auth_wait}s for authentication signatures/popups...")
+                        await asyncio.sleep(auth_wait)
+                    
                     return True
             except Exception:
                 pass
