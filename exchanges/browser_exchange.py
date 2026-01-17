@@ -29,46 +29,64 @@ class BrowserExchange(ExchangeClient):
         try:
             self.playwright = await async_playwright().start()
             
-            # Proxy Configuration
-            proxy_settings = None
+            # 1. Prepare Proxy Config (Split Server vs Credentials)
+            launch_proxy = None
+            http_credentials = None
+
             if self.proxy_url:
                 from urllib.parse import urlparse
                 parsed = urlparse(self.proxy_url)
                 
-                # Extract credentials if present in URL
+                # Server is always required for launch
+                server_url = f"{parsed.scheme}://{parsed.hostname}:{parsed.port}"
+                launch_proxy = {"server": server_url}
+
+                # Credentials go to context/http_credentials
                 if parsed.username and parsed.password:
-                    proxy_settings = {
-                        "server": f"{parsed.scheme}://{parsed.hostname}:{parsed.port}",
+                    http_credentials = {
                         "username": parsed.username,
                         "password": parsed.password
                     }
-                else:
-                    proxy_settings = {"server": self.proxy_url}
 
-            launch_args = {
+            # 2. Prepare Launch Args
+            # Add Linux stability args
+            stability_args = [
+                "--disable-blink-features=AutomationControlled",
+                "--disable-gpu",
+                "--no-sandbox", 
+                "--disable-dev-shm-usage",
+                "--disable-features=VizDisplayCompositor"
+            ]
+
+            common_args = {
                 "headless": self.headless,
-                "args": ["--disable-blink-features=AutomationControlled"], # Basic stealth
+                "args": stability_args,
             }
-            
-            # NOTE: When using launch_persistent_context, proxy MUST be passed in launch_args
+
+            if launch_proxy:
+                common_args["proxy"] = launch_proxy
+
+            # 3. Launch Browser
             if self.user_data_dir:
-                if proxy_settings:
-                    launch_args["proxy"] = proxy_settings
+                # Persistent Context: http_credentials goes directly here
+                if http_credentials:
+                    common_args["http_credentials"] = http_credentials
                     
                 self.context = await self.playwright.chromium.launch_persistent_context(
                     user_data_dir=self.user_data_dir,
-                    **launch_args
+                    **common_args
                 )
             else:
-                # For non-persistent, we pass proxy to launch() AND new_context() 
-                # passing it to launch() avoids the 'proxy login' popup in visible mode
-                if proxy_settings:
-                    launch_args["proxy"] = proxy_settings
+                # Non-Persistent: Launch -> New Context (with credentials)
+                self.browser = await self.playwright.chromium.launch(**common_args)
+                
+                context_args = {}
+                if http_credentials:
+                    context_args["http_credentials"] = http_credentials
                     
-                self.browser = await self.playwright.chromium.launch(**launch_args)
-                self.context = await self.browser.new_context() # Proxy already inherited from launch
+                self.context = await self.browser.new_context(**context_args)
 
-            self.page = await self.context.new_page()
+            self.page = await self.context.new_page() if not self.user_data_dir else self.context.pages[0]
             
             logger.info(f"Navigating to {self.url}...")
             await self.page.goto(self.url)
