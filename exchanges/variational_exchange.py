@@ -47,6 +47,10 @@ class VariationalExchange(BrowserExchange):
         s = self.config.get('selectors', {})
         try:
             logger.info("Waiting for Variational UI to load...")
+            
+            # 0. Check for Captcha / Cloudflare
+            await self._handle_captcha()
+
             # 1. Wait for basic UI structure
             await self.page.wait_for_load_state('networkidle', timeout=20000)
             
@@ -58,6 +62,44 @@ class VariationalExchange(BrowserExchange):
             logger.warning(f"Startup warning: {e}")
             return False
 
+    async def _handle_captcha(self):
+        """Checks for Cloudflare/Captcha and pauses/notifies if detected."""
+        try:
+            # Common patterns for Cloudflare or generic captchas
+            captcha_selectors = [
+                 "iframe[title*='Cloudflare']",
+                 "div:has-text('Verify you are human')",
+                 "div:has-text('Checking if the site connection is secure')"
+            ]
+            
+            for _ in range(3): # Quick checks
+                found = False
+                for sel in captcha_selectors:
+                    if await self.page.is_visible(sel):
+                        found = True
+                        break
+                
+                if found:
+                    logger.warning("CAPTCHA DETECTED! Waiting up to 2 minutes for resolution...")
+                    # Wait loop
+                    for w in range(24): # 2 mins (24 * 5s)
+                        await asyncio.sleep(5)
+                        # Check if gone
+                        still_there = False
+                        for sel in captcha_selectors:
+                            if await self.page.is_visible(sel):
+                                still_there = True
+                                break
+                        if not still_there:
+                            logger.info("Captcha appears to be resolved.")
+                            return
+                    logger.error("Captcha timed out. Manual intervention required.")
+                    return
+
+                await asyncio.sleep(1)
+        except Exception as e:
+            logger.debug(f"Error checking captcha: {e}")
+
     async def _ensure_wallet_connected(self, selectors: Dict):
         """Checks for connection and attempts to connect if disconnected."""
         logger.info("Verifying Wallet Connection...")
@@ -65,42 +107,54 @@ class VariationalExchange(BrowserExchange):
         success_indicator = selectors.get('account_details', '.portfolio-details')
         connect_btn = selectors.get('connect_wallet_btn', "button:has-text('Connect Wallet')")
 
-        # Retry loop for initial connection (e.g., waiting for user logic)
-        max_retries = 3
+        # Retry loop for initial connection - giving ample time for user interaction
+        max_duration = 300 # 5 minutes
+        poll_interval = 5
         
-        for i in range(max_retries):
-            # 1. Check if already connected
+        start_time = asyncio.get_event_loop().time()
+        
+        while (asyncio.get_event_loop().time() - start_time) < max_duration:
+            # 1. Check if definitely DISCONNECTED (Connect button visible)
+            is_disconnected = False
             try:
-                if await self.page.is_visible(success_indicator):
+                if await self.page.is_visible(connect_btn):
+                    is_disconnected = True
+                    # Only click it once or if it reappears distinctively?
+                    # Better to let the user do it if headless=False, or click it if we can.
+                    # We'll click it once per loop iteration if it's there, 
+                    # but only if we haven't clicked it recently to avoid spamming.
+                    
+                    # If headless=True, we MUST click it.
+                    # If headless=False, user might do it.
+                    # Let's try to click it automatically.
+                    logger.info("Connect Wallet button visible. Clicking...")
+                    await self.page.click(connect_btn)
+                    await asyncio.sleep(2) # Wait for modal
+            except Exception:
+                pass
+
+            # 2. Check if CONNECTED (Success indicator visible AND Connect button NOT visible)
+            try:
+                connected = await self.page.is_visible(success_indicator)
+                btn_visible = await self.page.is_visible(connect_btn)
+                
+                if connected and not btn_visible:
+                    # Double check balance isn't empty/loading?
+                    # For now, this is a strong signal of connection.
                     logger.info("Wallet detected as CONNECTED.")
                     return True
             except Exception:
                 pass
-
-            # 2. Not connected? Try to click Connect
-            logger.info(f"Wallet not connected. Attempt {i+1}/{max_retries} to connect...")
-            try:
-                if await self.page.is_visible(connect_btn):
-                    logger.info("Clicking Connect Wallet button...")
-                    await self.page.click(connect_btn)
-                    
-                    # Wait for user action
-                    logger.info("Waiting 30s for wallet connection...")
-                    try:
-                        await self.page.wait_for_selector(success_indicator, state='visible', timeout=30000)
-                        logger.info("Wallet connected successfully!")
-                        return True
-                    except Exception:
-                        logger.warning("Timed out waiting for user to connect wallet.")
-            except Exception as e:
-                logger.debug(f"Connect button interaction failed: {e}")
             
-            # Short wait before retry
-            await asyncio.sleep(2)
+            # 3. Wait and Log
+            elapsed = int(asyncio.get_event_loop().time() - start_time)
+            if elapsed % 15 == 0:
+                logger.info(f"Waiting for wallet connection... ({elapsed}s elapsed)")
             
-        logger.error("Failed to establish wallet connection after retries.")
-        # Final check
-        return await self.page.is_visible(success_indicator)
+            await asyncio.sleep(poll_interval)
+            
+        logger.error("Failed to establish wallet connection after waiting.")
+        return False
 
     async def get_orderbook_price(self, symbol: str) -> Tuple[float, float]:
         """
@@ -140,14 +194,22 @@ class VariationalExchange(BrowserExchange):
         Selector needs to be configured in .env as VARIATIONAL_SELECTOR_BALANCE
         """
         selector = self.config.get('selectors', {}).get('balance_text', '.portfolio-value') 
-        try:
-            text = await self._get_text(selector)
-            # Remove symbols like $, USDb, etc
-            clean_text = text.replace('$','').replace(',','').replace('USDb','').strip()
-            return float(clean_text)
-        except Exception as e:
-            logger.debug(f"Failed to scrape balance: {e}")
-            return 0.0
+        
+        # Retry logic for reading balance (sometimes it loads as 0 momentarily)
+        for _ in range(3):
+            try:
+                text = await self._get_text(selector)
+                # Remove symbols like $, USDb, etc
+                clean_text = text.replace('$','').replace(',','').replace('USDb','').strip()
+                val = float(clean_text)
+                if val > 0:
+                    return val
+            except Exception as e:
+                logger.debug(f"Failed to scrape balance: {e}")
+            
+            await asyncio.sleep(1)
+            
+        return 0.0
 
     async def get_market_precision(self, symbol: str) -> int:
         """
